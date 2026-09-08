@@ -15,6 +15,15 @@ static KNOWNMODEL mod_known[MAX_MOD_KNOWN];
 static DWORD mod_registration_sequence = 1;
 static PATHSTR r_map_asset_scope;
 
+static LPCSTR R_MapAssetBasename(LPCSTR asset) {
+    LPCSTR slash;
+
+    if (!asset) return NULL;
+    slash = strrchr(asset, '\\');
+    if (!slash) slash = strrchr(asset, '/');
+    return slash ? slash + 1 : asset;
+}
+
 /* A game renderer may install an archive/directory scope for map-local assets.
  * Shared model/texture caches use the resolved scoped path as their identity. */
 BOOL R_MapAssetCandidate(LPCSTR asset, LPSTR candidate, DWORD candidate_size) {
@@ -28,6 +37,32 @@ BOOL R_MapAssetCandidate(LPCSTR asset, LPSTR candidate, DWORD candidate_size) {
     if (asset[0] == '/' || asset[0] == '\\' || (asset[0] && asset[1] == ':')) return false;
     written = snprintf(candidate, candidate_size, "%s\\%s", r_map_asset_scope, asset);
     return written > 0 && (DWORD)written < candidate_size;
+}
+
+/* Imported map files are not consistent across Warcraft III editors: some
+ * maps keep the authored path, some flatten the basename at the archive root,
+ * and some put it below war3mapImported.  Keep these aliases at the renderer
+ * boundary so the server can continue using the compact model index protocol.
+ */
+BOOL R_MapAssetImportedCandidate(LPCSTR asset, LPSTR candidate, DWORD candidate_size) {
+    LPCSTR base;
+
+    if (!asset || !*asset || !candidate || candidate_size == 0 || !r_map_asset_scope[0]) return false;
+    base = R_MapAssetBasename(asset);
+    if (!base || !*base) return false;
+    return snprintf(candidate, candidate_size, "%s\\war3mapImported\\%s",
+                    r_map_asset_scope, base) > 0 &&
+           strlen(candidate) < candidate_size;
+}
+
+BOOL R_MapAssetRootCandidate(LPCSTR asset, LPSTR candidate, DWORD candidate_size) {
+    LPCSTR base;
+
+    if (!asset || !*asset || !candidate || candidate_size == 0 || !r_map_asset_scope[0]) return false;
+    base = R_MapAssetBasename(asset);
+    if (!base || !*base) return false;
+    return snprintf(candidate, candidate_size, "%s\\%s", r_map_asset_scope, base) > 0 &&
+           strlen(candidate) < candidate_size;
 }
 
 void R_SetMapAssetScope(LPCSTR scope) {
@@ -72,12 +107,25 @@ static LPMODEL R_LoadRegisteredModelPath(LPCSTR modelFilename, BOOL cache_missin
 
 /* Quake II keeps one renderer model entry per resolved filename and marks it during registration. */
 LPMODEL R_LoadRegisteredModel(LPCSTR modelFilename) {
-    PATHSTR scoped;
+    PATHSTR candidates[4];
+    DWORD candidate_count = 0;
     LPMODEL model;
 
     if (!modelFilename || !*modelFilename) return R_LoadEmptyModel("<empty>", "empty filename");
-    if (R_MapAssetCandidate(modelFilename, scoped, sizeof(scoped))) {
-        model = R_LoadRegisteredModelPath(scoped, false);
+    if (R_MapAssetCandidate(modelFilename, candidates[candidate_count], sizeof(candidates[0])))
+        candidate_count++;
+    if (R_MapAssetImportedCandidate(modelFilename, candidates[candidate_count], sizeof(candidates[0])))
+        candidate_count++;
+    if (R_MapAssetRootCandidate(modelFilename, candidates[candidate_count], sizeof(candidates[0])))
+        candidate_count++;
+    if (R_MapAssetImportedCandidate(modelFilename, candidates[candidate_count], sizeof(candidates[0])))
+        candidate_count++;
+
+    FOR_LOOP(i, candidate_count) {
+        BOOL duplicate = false;
+        FOR_LOOP(j, i) if (!strcasecmp(candidates[i], candidates[j])) duplicate = true;
+        if (duplicate) continue;
+        model = R_LoadRegisteredModelPath(candidates[i], false);
         if (model) return model;
     }
     return R_LoadRegisteredModelPath(modelFilename, true);

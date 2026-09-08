@@ -18,6 +18,9 @@ extern MacId  objc_getClass(const char *name);
 extern MacSel sel_registerName(const char *str);
 extern MacId  objc_msgSend(MacId, MacSel, ...);
 #endif
+#ifndef _WIN32
+#include <strings.h>
+#endif
 #ifndef __APPLE__
 #include <SDL2/SDL_opengl.h>
 #endif
@@ -279,26 +282,37 @@ static LPTEXTURE R_LoadTexturePath(LPCSTR textureFilename, BOOL *found) {
 }
 
 LPTEXTURE R_LoadTexture(LPCSTR textureFilename) {
-    PATHSTR scoped;
+    PATHSTR candidates[4];
+    DWORD candidate_count = 0;
     LPTEXTURE texture;
     BOOL found = false;
-    BOOL has_scope;
 
     if (!textureFilename || !*textureFilename) return tr.texture[TEX_PLACEHOLDER];
-    has_scope = R_MapAssetCandidate(textureFilename, scoped, sizeof(scoped));
-    if (has_scope) {
-        texture = R_LoadTexturePath(scoped, &found);
+    if (R_MapAssetCandidate(textureFilename, candidates[candidate_count], sizeof(candidates[0])))
+        candidate_count++;
+    if (R_MapAssetImportedCandidate(textureFilename, candidates[candidate_count], sizeof(candidates[0])))
+        candidate_count++;
+    if (R_MapAssetRootCandidate(textureFilename, candidates[candidate_count], sizeof(candidates[0])))
+        candidate_count++;
+    if (R_MapAssetImportedCandidate(textureFilename, candidates[candidate_count], sizeof(candidates[0])))
+        candidate_count++;
+
+    FOR_LOOP(i, candidate_count) {
+        BOOL duplicate = false;
+        FOR_LOOP(j, i) if (!strcasecmp(candidates[i], candidates[j])) duplicate = true;
+        if (duplicate) continue;
+        texture = R_LoadTexturePath(candidates[i], &found);
         if (found) return texture;
     }
     texture = R_LoadTexturePath(textureFilename, &found);
     if (found) {
-        if (has_scope) R_CacheLoadedTexture(scoped, texture);
+        FOR_LOOP(i, candidate_count) R_CacheLoadedTexture(candidates[i], texture);
         return texture;
     }
     /* Missing registrations are resident too: repeated draw paths must not search every MPQ again. */
     fprintf(stderr, "R_LoadTexture: not found: %s\n", textureFilename);
     R_CacheLoadedTexture(textureFilename, tr.texture[TEX_PLACEHOLDER]);
-    if (has_scope) R_CacheLoadedTexture(scoped, tr.texture[TEX_PLACEHOLDER]);
+    FOR_LOOP(i, candidate_count) R_CacheLoadedTexture(candidates[i], tr.texture[TEX_PLACEHOLDER]);
     return tr.texture[TEX_PLACEHOLDER];
 }
 

@@ -246,7 +246,13 @@ LPMODEL R_LoadModel(LPCSTR modelFilename) {
     if (*(DWORD *)buffer == ID_MDLX) {
         model = ri.MemAlloc(sizeof(model_t));
         model->mdx = R_LoadModelMDLX(buffer, fileSize);
-        model->modeltype = ID_MDLX;
+        if (!model->mdx) {
+            ri.MemFree(model);
+            model = NULL;
+            fprintf(stderr, "R_LoadModel: failed to parse MDLX %s\n", modelFilename);
+        } else {
+            model->modeltype = ID_MDLX;
+        }
     } else if (R_W3PathHasExtension(modelFilename, ".mdl")) {
         /* Same case-insensitive issue: use stem length, not strstr. */
         PATHSTR tempFileName = { 0 };

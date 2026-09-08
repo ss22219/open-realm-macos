@@ -397,6 +397,8 @@ LPMODEL R_LoadRegisteredModel(LPCSTR modelFilename);
 void R_ReleaseRegisteredModel(LPMODEL model);
 void R_RegisterMapAssets(LPCSTR mapFileName);
 BOOL R_MapAssetCandidate(LPCSTR asset, LPSTR candidate, DWORD candidate_size);
+BOOL R_MapAssetImportedCandidate(LPCSTR asset, LPSTR candidate, DWORD candidate_size);
+BOOL R_MapAssetRootCandidate(LPCSTR asset, LPSTR candidate, DWORD candidate_size);
 void R_SetMapAssetScope(LPCSTR scope);
 void R_ShutdownModels(void);
 
