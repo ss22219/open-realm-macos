@@ -1,0 +1,405 @@
+#include "r_local.h"
+#include "r_game.h"
+#ifdef WOW
+#include "common/ui_constants.h"
+#include "common/wow_view.h"
+#endif
+#include <float.h>
+#include <stdlib.h>
+
+void R_GetEntityMatrix(renderEntity_t const *entity, LPMATRIX4 matrix) {
+    VECTOR3 origin = entity->origin;
+
+    if (R_EntityMatrix(entity, matrix)) {
+        return;
+    }
+
+    Matrix4_identity(matrix);
+    Matrix4_translate(matrix, &origin);
+    Matrix4_rotate(matrix, &(VECTOR3){0, 0, entity->angle * 180 / M_PI}, ROTATE_XYZ);
+    Matrix4_scale(matrix, &(VECTOR3){entity->scale, entity->scale, entity->scale});
+}
+
+static int R_DebugEntities(void) {
+    return atoi(ri.CvarString ? ri.CvarString("r_debug_entities", "0") : "0");
+}
+
+static BOOL R_EntityInView(renderEntity_t const *entity) {
+    float radius;
+
+    if (!entity || (entity->flags & RF_HIDDEN) || !entity->model) {
+        return false;
+    }
+    if (tr.viewDef.rdflags & RDF_NOFRUSTUMCULL) {
+        return true;
+    }
+
+    radius = MAX(entity->radius * MAX(entity->scale, 1.0f), 16.0f);
+    return Frustum_ContainsSphere(&tr.viewDef.frustum, &(SPHERE3){
+        .center = entity->origin,
+        .radius = radius,
+    });
+}
+
+static void R_DrawEntityShadows(BOOL shad);
+
+void R_DrawEntities(void) {
+    static BYTE prev_state[MAX_GAME_ENTITIES];
+    static BOOL initialized = false;
+    BYTE state[MAX_GAME_ENTITIES];
+    int debug_entities = R_DebugEntities();
+    DWORD drawn = 0;
+    DWORD culled = 0;
+
+    if (!R_CvarEnabled("r_entities", "1")) return;
+    if (debug_entities) {
+        memset(state, 0, sizeof(state));
+    } else {
+        initialized = false;
+    }
+
+    BOOL shad = R_CvarEnabled("r_unit_shadows", "1");
+
+    R_DrawEntityShadows(shad);
+
+    FOR_LOOP(i, tr.viewDef.num_entities) {
+        renderEntity_t const *ent = tr.viewDef.entities+i;
+        BOOL in_view = R_EntityInView(ent);
+
+        if (debug_entities && ent->number < MAX_GAME_ENTITIES) {
+            state[ent->number] = in_view ? 2 : 1;
+        }
+        if (in_view) {
+            drawn++;
+            R_DrawEntity(ent, shad);
+        } else {
+            culled++;
+        }
+    }
+
+    if (debug_entities) {
+        if (initialized) {
+            FOR_LOOP(i, MAX_GAME_ENTITIES) {
+                if (prev_state[i] == state[i]) {
+                    continue;
+                }
+                if (!prev_state[i] && state[i]) {
+                    fprintf(stderr,
+                            "R entity entered frame_time=%u ent=%u state=%s\n",
+                            (unsigned)tr.viewDef.time,
+                            (unsigned)i,
+                            state[i] == 2 ? "drawn" : "culled");
+                } else if (prev_state[i] && !state[i]) {
+                    fprintf(stderr,
+                            "R entity left frame_time=%u ent=%u prev=%s\n",
+                            (unsigned)tr.viewDef.time,
+                            (unsigned)i,
+                            prev_state[i] == 2 ? "drawn" : "culled");
+                } else {
+                    fprintf(stderr,
+                            "R entity cull-change frame_time=%u ent=%u %s->%s\n",
+                            (unsigned)tr.viewDef.time,
+                            (unsigned)i,
+                            prev_state[i] == 2 ? "drawn" : "culled",
+                            state[i] == 2 ? "drawn" : "culled");
+                }
+            }
+        }
+        if (debug_entities > 1) {
+            fprintf(stderr,
+                    "R entity summary frame_time=%u view=%u drawn=%u culled=%u\n",
+                    (unsigned)tr.viewDef.time,
+                    (unsigned)tr.viewDef.num_entities,
+                    (unsigned)drawn,
+                    (unsigned)culled);
+        }
+        memcpy(prev_state, state, sizeof(prev_state));
+        initialized = true;
+    }
+}
+
+void R_DrawSplatRects(void) {
+    if (!tr.viewDef.num_splat_rects || !tr.viewDef.splat_rects) {
+        return;
+    }
+
+    R_BeginSplatBatch(R_SPLAT_SHADER(&tr.shader_splat));
+    FOR_LOOP(i, tr.viewDef.num_splat_rects) {
+        renderSplatRect_t const *rect = tr.viewDef.splat_rects + i;
+        BOX3 bounds;
+
+        if (rect->maxs.x <= rect->mins.x || rect->maxs.y <= rect->mins.y) {
+            continue;
+        }
+        if (!(tr.viewDef.rdflags & RDF_NOFRUSTUMCULL)) {
+            bounds = (BOX3){
+                .min = { rect->mins.x, rect->mins.y, -4096.0f },
+                .max = { rect->maxs.x, rect->maxs.y, 4096.0f },
+            };
+            if (!Frustum_ContainsAABox(&tr.viewDef.frustum, &bounds)) {
+                continue;
+            }
+        }
+        R_AddRectSplat(&rect->mins, &rect->maxs, tr.texture[TEX_WHITE], rect->color);
+    }
+    R_EndSplatBatch();
+}
+
+void R_DrawDecals(void) {
+    FOR_LOOP(i, tr.viewDef.num_decals) {
+        renderDecal_t const *decal = tr.viewDef.decals + i;
+        BOX3 bounds;
+
+        if (!decal->texture || decal->radius <= 0.0f) {
+            continue;
+        }
+        if (!(tr.viewDef.rdflags & RDF_NOFRUSTUMCULL)) {
+            bounds = (BOX3){
+                .min = { decal->origin.x - decal->radius, decal->origin.y - decal->radius, -4096.0f },
+                .max = { decal->origin.x + decal->radius, decal->origin.y + decal->radius, 4096.0f },
+            };
+            if (!Frustum_ContainsAABox(&tr.viewDef.frustum, &bounds)) {
+                continue;
+            }
+        }
+        R_RenderSplat(&decal->origin, decal->radius, decal->texture, R_SPLAT_SHADER(&tr.shader_splat), decal->color);
+    }
+}
+
+static VECTOR2 R_PointToViewSpace(viewDef_t const *viewdef, float x, float y) {
+    size2_t window = R_GetWindowSize();
+    RECT viewport = viewdef ? viewdef->viewport : (RECT){ 0, 0, 1, 1 };
+    FLOAT left;
+    FLOAT top;
+    FLOAT width;
+    FLOAT height;
+
+    if (viewport.w <= 0.0f || viewport.h <= 0.0f) {
+        viewport = (RECT){ 0, 0, 1, 1 };
+    }
+    left = viewport.x * window.width;
+    top = (1.0f - (viewport.y + viewport.h)) * window.height;
+    width = viewport.w * window.width;
+    height = viewport.h * window.height;
+    return (VECTOR2){
+        .x = ((x - left) / width - 0.5f) * 2.0f,
+        .y = (0.5f - (y - top) / height) * 2.0f,
+    };
+}
+
+LINE3 R_LineForScreenPoint(viewDef_t const *viewdef, float x, float y) {
+    MATRIX4 invproj;
+    Matrix4_inverse(&viewdef->viewProjectionMatrix, &invproj);
+    VECTOR2 const p = R_PointToViewSpace(viewdef, x, y);
+    LINE3 const line = {
+        Matrix4_multiply_vector3(&invproj, &(VECTOR3 const) { p.x, p.y, 0 }),
+        Matrix4_multiply_vector3(&invproj, &(VECTOR3 const) { p.x, p.y, 1 }),
+    };
+    return line;
+}
+
+/* Drag-panning stays on the camera target plane instead of jumping across terrain tiers. */
+bool R_TraceCameraPlane(viewDef_t const *viewdef, float x, float y, LPVECTOR3 point) {
+    LINE3 line;
+    PLANE3 plane;
+
+    if (!viewdef || !point) return false;
+    line = R_LineForScreenPoint(viewdef, x, y);
+    plane = (PLANE3){ .normal = { 0, 0, 1 }, .distance = -viewdef->camerastate[0].origin.z };
+    return Line3_intersect_plane3(&line, &plane, point);
+}
+
+bool R_TraceEntity(viewDef_t const *viewdef, float x, float y, LPDWORD number) {
+    if (!viewdef || !number) {
+        return false;
+    }
+    LINE3 const line = R_LineForScreenPoint(viewdef, x, y);
+    FLOAT best = FLT_MAX;
+    DWORD best_number = 0;
+
+    FOR_LOOP(i, viewdef->num_entities) {
+        renderEntity_t *ent = &viewdef->entities[i];
+        FLOAT distance;
+
+        if (!ent->number || !ent->model || (ent->flags & (RF_HIDDEN | RF_NOT_SELECTABLE))) {
+            continue;
+        }
+        if (R_TraceModel(ent, &line, &distance) && distance < best) {
+            best = distance;
+            best_number = ent->number;
+        }
+    }
+    if (best_number) {
+        *number = best_number;
+        return true;
+    }
+    return false;
+}
+
+DWORD R_EntitiesInRect(viewDef_t const *viewdef, LPCRECT rect, DWORD max, LPDWORD array) {
+    if (!viewdef || !rect || !array || max == 0) {
+        return 0;
+    }
+    tr.viewDef = *viewdef;
+    VECTOR2 const a = R_PointToViewSpace(viewdef, rect->x, rect->y);
+    VECTOR2 const b = R_PointToViewSpace(viewdef, rect->x+rect->w, rect->y+rect->h);
+    RECT const screen = {
+        .x = MIN(a.x, b.x),
+        .y = MIN(a.y, b.y),
+        .w = MAX(a.x, b.x) - MIN(a.x, b.x),
+        .h = MAX(a.y, b.y) - MIN(a.y, b.y),
+    };
+    DWORD count = 0;
+    FOR_LOOP(i, viewdef->num_entities) {
+        renderEntity_t const *ent = &viewdef->entities[i];
+        if (!ent->number || !ent->model || (ent->flags & (RF_HIDDEN | RF_NOT_SELECTABLE))) {
+            continue;
+        }
+        VECTOR3 const org = Matrix4_multiply_vector3(&viewdef->viewProjectionMatrix, &ent->origin);
+        if (Rect_contains(&screen, (LPVECTOR2)&org)) {
+            if (count >= max) {
+                break;
+            }
+            array[count++] = ent->number;
+        }
+    }
+    return count;
+}
+
+DWORD selCircles[NUM_SELECTION_CIRCLES] = { 100, 300, 100000 };
+
+static void R_RenderUberSplat(const renderEntity_t *entity, LPCVECTOR2 origin) {
+    if (entity->splat && !(entity->flags & RF_NO_UBERSPLAT)) {
+        R_RenderSplat(origin, entity->splatsize, entity->splat, R_SPLAT_SHADER(&tr.shader_default), COLOR32_WHITE);
+    }
+}
+
+static void R_DrawEntityShadow(const renderEntity_t *entity, LPCVECTOR2 origin, BOOL shad) {
+#ifndef USE_SHADOWMAPS
+    LPCTEXTURE shadow = entity->shadow;
+    BOX3 bounds;
+
+    if (R_RenderShadow(entity, origin)) {
+        return;
+    }
+    if (!shad || !shadow || (entity->flags & RF_NO_SHADOW) || !tr.world) {
+        return;
+    }
+
+    VECTOR2 mins;
+    VECTOR2 maxs;
+    if (entity->shadow_rect.w > 0 && entity->shadow_rect.h > 0) {
+        mins.x = origin->x - entity->shadow_rect.x;
+        mins.y = origin->y - entity->shadow_rect.y;
+        maxs.x = mins.x + entity->shadow_rect.w;
+        maxs.y = mins.y + entity->shadow_rect.h;
+    } else {
+        int pivot_x = (int)(shadow->width * 0.3f + 0.5f);
+        int pivot_y = (int)(shadow->height * 0.7f + 0.5f);
+        float width = shadow->width * 32.0f;
+        float height = shadow->height * 32.0f;
+        mins.x = origin->x - pivot_x * 32.0f;
+        mins.y = origin->y - (shadow->height - pivot_y) * 32.0f;
+        maxs.x = mins.x + width;
+        maxs.y = mins.y + height;
+    }
+
+    COLOR32 shadowColor = {0, 0, 0, 128};
+    if (!(tr.viewDef.rdflags & RDF_NOFRUSTUMCULL)) {
+        bounds = (BOX3){
+            .min = { mins.x, mins.y, entity->origin.z - 32.0f },
+            .max = { maxs.x, maxs.y, entity->origin.z + 32.0f },
+        };
+        if (!Frustum_ContainsAABox(&tr.viewDef.frustum, &bounds)) {
+            return;
+        }
+    }
+    R_AddRectSplat(&mins, &maxs, shadow, shadowColor);
+#endif
+}
+
+/* Unit shadows are ground decals that share one shader and differ only by
+ * texture and rect.  Drawing each in isolation re-uploaded the vertex buffer
+ * and re-issued all splat GL state per unit; batching them across the scene
+ * collapses runs of same-texture shadows into one upload + draw (flushing on
+ * texture change or buffer capacity), instead of one per unit. */
+static void R_DrawEntityShadows(BOOL shad) {
+#ifndef USE_SHADOWMAPS
+    if (!shad) return;
+    R_BeginSplatBatch(R_SPLAT_SHADER(&tr.shader_shadowSplat));
+    FOR_LOOP(i, tr.viewDef.num_entities) {
+        renderEntity_t const *ent = tr.viewDef.entities + i;
+        if ((ent->flags & RF_HIDDEN) || !ent->model) {
+            continue;
+        }
+        R_DrawEntityShadow(ent, (LPCVECTOR2)&ent->origin, shad);
+    }
+    R_EndSplatBatch();
+#endif
+}
+
+static void R_RenderSelectedCircle(const renderEntity_t *entity, LPCVECTOR2 origin) {
+    if (entity->flags & RF_SELECTED) {
+        COLOR32 color;
+        if (entity->flags & RF_HOSTILE) {
+            color = MAKE(COLOR32, 255, 80, 80, 255);
+        } else if (entity->flags & RF_NEUTRAL) {
+            color = MAKE(COLOR32, 255, 220, 80, 255);
+        } else {
+            color = MAKE(COLOR32, 80, 200, 80, 255);
+        }
+        float radius = R_SelectionRadius(entity);
+        FOR_LOOP(i, NUM_SELECTION_CIRCLES) {
+            if ((radius * 2) > selCircles[i])
+                continue;
+            /* A flat actor-Z quad intersects sloped terrain; the splat path fits the ring to terrain samples. */
+            R_RenderSplat(origin, radius, tr.texture[TEX_SELECTION_CIRCLE+i], R_SPLAT_SHADER(&tr.shader_splat), color);
+            break;
+        }
+    }
+}
+
+/* Subtle highlight circle for the entity under the mouse cursor. */
+static void R_RenderHoverHighlight(renderEntity_t const *entity) {
+    if (entity->number != tr.viewDef.hover_entity || entity->number == 0) {
+        return;
+    }
+    if (entity->flags & RF_SELECTED) {
+        return; /* selection circle already visible, skip hover */
+    }
+    COLOR32 color;
+    if (entity->flags & RF_HOSTILE) {
+        color = MAKE(COLOR32, 255, 80, 80, 128);   /* enemy: faint red */
+    } else if (entity->flags & RF_NEUTRAL) {
+        color = MAKE(COLOR32, 255, 220, 80, 128);  /* neutral/passive ally: faint yellow */
+    } else {
+        color = MAKE(COLOR32, 80, 200, 80, 128);   /* own/shared-control: faint green */
+    }
+    float radius = R_SelectionRadius(entity);
+    FOR_LOOP(i, NUM_SELECTION_CIRCLES) {
+        if ((radius * 2) > selCircles[i])
+            continue;
+        R_RenderSplat(&(VECTOR2){ entity->origin.x, entity->origin.y },
+                      radius, tr.texture[TEX_SELECTION_CIRCLE+i],
+                      R_SPLAT_SHADER(&tr.shader_splat), color);
+        break;
+    }
+}
+
+void R_DrawEntity(renderEntity_t const *entity, BOOL shad) {
+    if ((entity->flags & RF_HIDDEN) || !entity->model)
+        return;
+
+#ifdef USE_SHADOWMAPS
+    if (tr.render_phase == RENDER_PHASE_LIGHTS) {
+        if (shad && !(entity->flags & RF_NO_SHADOW))
+            R_RenderModel(entity);
+        return;
+    }
+#endif
+
+    R_RenderUberSplat(entity, (LPCVECTOR2)&entity->origin);
+    R_RenderModel(entity);
+    R_RenderSelectedCircle(entity, (LPCVECTOR2)&entity->origin);
+    R_RenderHoverHighlight(entity);
+}

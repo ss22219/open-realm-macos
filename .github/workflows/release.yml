@@ -1,0 +1,156 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach assets to (e.g. v0.0.1-alpha)'
+        required: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x64
+            archive: openwarcraft3-linux-x64.tar.gz
+          - os: macos-latest
+            name: macos-x64
+            archive: openwarcraft3-macos-x64.tar.gz
+          - os: windows-latest
+            name: windows-x64
+            archive: openwarcraft3-windows-x64.zip
+
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgles2-mesa-dev \
+            libsdl2-dev \
+            libjpeg-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install sdl2 libjpeg
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-libepoxy
+            make
+            zip
+
+      - name: Build (Unix)
+        if: runner.os != 'Windows'
+        run: make build
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: make build
+
+      - name: Create release archive (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p release
+          cp build/bin/openwarcraft3 release/
+          cp -r build/lib/. release/
+          cp -r build/share release/
+          tar -czf ${{ matrix.archive }} -C release .
+
+      - name: Create release archive (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          mkdir -p release
+          cp build/bin/openwarcraft3.exe release/
+          cp -r build/lib/. release/
+          cp -r build/share release/
+          cd release && zip -r ../${{ matrix.archive }} .
+
+      - name: Determine release tag
+        id: get_tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh release upload "${{ steps.get_tag.outputs.tag }}" \
+            "${{ matrix.archive }}" \
+            --clobber
+
+  flatpak:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Flatpak build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder ostree zip
+
+      - name: Install Flatpak runtime and SDK
+        working-directory: dist-scripts/flathub
+        run: ./deps.sh
+
+      - name: Build Flatpak bundle
+        working-directory: dist-scripts/flathub
+        run: ./build.sh
+
+      - name: Determine release tag
+        id: get_tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW_TAG="${{ github.event.inputs.tag }}"
+          else
+            RAW_TAG="${{ github.ref_name }}"
+          fi
+          SAFE_TAG="$(printf '%s' "$RAW_TAG" | sed 's#[^A-Za-z0-9._-]#-#g')"
+          echo "tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
+          echo "safe_tag=$SAFE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble Flatpak installer package
+        run: |
+          zip -j "build/openrealm-flatpak-${{ steps.get_tag.outputs.safe_tag }}.zip" \
+            build/io.github.corepunch.OpenRealm.flatpak \
+            dist-scripts/flathub/install.sh \
+            dist-scripts/flathub/uninstall.sh
+
+      - name: Upload Flatpak release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ steps.get_tag.outputs.tag }}" \
+            build/io.github.corepunch.OpenRealm.flatpak \
+            "build/openrealm-flatpak-${{ steps.get_tag.outputs.safe_tag }}.zip" \
+            --clobber

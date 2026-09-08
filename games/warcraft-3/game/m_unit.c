@@ -1,0 +1,1607 @@
+#include "g_local.h"
+
+//void unit_die(LPEDICT self);
+//void unit_decay2(LPEDICT self);
+void unit_decay1(LPEDICT self);
+void unit_begin_decay(LPEDICT self);
+void unit_decay_think(LPEDICT self);
+void unit_cooldown(LPEDICT self);
+void unit_stand(LPEDICT self);
+BOOL G_UnitIsHero(LPCEDICT ent);
+
+/* WC3 corpse lifetime: DecayTime (flesh, 2s) + BoneDecayTime (bone, 88s) = 90s
+ * after the death animation, then the corpse is removed (MiscData.txt). */
+#define UNIT_DECAY_SECONDS 90.0f
+
+void ai_birth2(LPEDICT self) {
+    unit_runwait(self, unit_stand);
+}
+
+//static mmove_t unit_move_decay2 = { "Decay Bone", NULL, unit_die };
+//static mmove_t unit_move_decay1 = { "Decay Flesh", NULL, unit_decay2 };
+static umove_t unit_move_birth = { "birth", ai_birth, unit_stand };
+static umove_t unit_move_stand = { "stand", ai_stand, unit_stand };
+static umove_t unit_move_stand_ready = { "stand ready", ai_stand, unit_stand };
+static umove_t unit_move_death = { "death", NULL, unit_begin_decay };
+/* The corpse holds its final death frame (AI_HOLD_FRAME) while the decay timer
+ * counts down; the model has no separate decay sequence we can rely on. */
+static umove_t unit_move_decay = { "decay", unit_decay_think, NULL };
+
+void unit_decay1(LPEDICT self) {
+    self->aiflags |= AI_HOLD_FRAME;
+}
+
+static void hero_become_revivable(LPEDICT self) {
+    LPGAMECLIENT owner;
+
+    if (!self || !self->inuse || !G_UnitIsHero(self) ||
+        (self->aiflags & AI_ILLUSION) || !(self->svflags & SVF_DEADMONSTER)) return;
+    self->revival.awaiting = true;
+    self->revival.reviving = false;
+    self->s.renderfx |= RF_HIDDEN;
+    G_PublishEvent(self, EVENT_PLAYER_HERO_REVIVABLE);
+    G_PublishEvent(self, EVENT_UNIT_HERO_REVIVABLE);
+    owner = G_GetPlayerClientByNumber(self->s.player);
+    if (owner && owner->ps.number == self->s.player) G_InvalidateCommands(owner);
+}
+
+/* Death animation finished: hold the corpse pose and start the removal timer. */
+void unit_begin_decay(LPEDICT self) {
+    unit_setmove(self, &unit_move_decay);
+    self->aiflags |= AI_HOLD_FRAME;
+    self->wait = G_UnitIsHero(self) && !(self->aiflags & AI_ILLUSION) &&
+        game.constants.dissipateTime > 0.0f
+        ? game.constants.dissipateTime
+        : UNIT_DECAY_SECONDS;
+}
+
+/* Ordinary corpses are removed. Heroes instead finish their dissipation timer,
+ * become hidden/awaiting-revive, and keep the same authoritative edict. */
+void unit_decay_think(LPEDICT self) {
+    if (G_UnitIsHero(self) && !(self->aiflags & AI_ILLUSION)) {
+        if (!self->revival.awaiting) unit_runwait(self, hero_become_revivable);
+        return;
+    }
+    unit_runwait(self, G_FreeEdict);
+}
+
+void unit_entercombat(LPEDICT self, LPEDICT target) {
+    if (!self || !target || target == self || M_IsDead(self) || M_IsDead(target)) {
+        return;
+    }
+    self->combatentity = target;
+}
+
+void unit_leavecombat(LPEDICT self) {
+    if (self) {
+        self->combatentity = NULL;
+    }
+}
+
+BOOL unit_affectingcombat(LPEDICT self) {
+    if (!self || M_IsDead(self)) {
+        return false;
+    }
+    if (!self->combatentity ||
+        !self->combatentity->inuse ||
+        M_IsDead(self->combatentity)) {
+        self->combatentity = NULL;
+        return false;
+    }
+    return true;
+}
+
+void unit_stand(LPEDICT self) {
+    /* Reaching stand is the common completion edge for Move, direct Attack,
+     * Repair, Harvest, and several cast behaviors. Retire transient state first,
+     * then let a pending Shift order become authoritative before installing the
+     * idle/default stand behavior. */
+    self->build = NULL;
+    self->s.renderfx &= ~RF_NO_UBERSPLAT;
+    self->s.ability = 255;
+    self->movement.last_distance = 0;
+    self->movement.blocked_frames = 0;
+    if (G_UnitStartNextQueuedOrder(self)) {
+        return;
+    }
+    if (self->movement.holding_position) {
+        unit_setmove(self, unit_affectingcombat(self)
+            ? &holdpos_move_stand_ready
+            : &holdpos_move_stand);
+    } else {
+        unit_setmove(self, unit_affectingcombat(self)
+            ? &unit_move_stand_ready
+            : &unit_move_stand);
+    }
+}
+
+/* All runtime unit-health changes pass here so intrinsic ability levels transition exactly once. */
+void G_SetHealth(LPEDICT ent, FLOAT value) {
+    BYTE const old = compress_stat(&ent->health);
+    ent->health.value = value;
+    if ((ent->s.flags & EF_BUILDING) && old != compress_stat(&ent->health)) S_RefreshAbilityLevel(ent, &a_on_fire);
+}
+
+void G_AddHealth(LPEDICT ent, FLOAT value) { G_SetHealth(ent, MIN(ent->health.max_value, ent->health.value + value)); }
+
+void unit_die(LPEDICT self, LPEDICT attacker) {
+    LPGAMECLIENT owner;
+    DWORD const selected_mask = self ? self->selected : 0;
+
+    S_AvatarExpire(self);
+    G_ClearUnitOrderQueue(self);
+    G_InvalidateUnitShortcutsForUnit(self);
+    G_SetHealth(self, 0.0f);
+    /* Construction owns Repair workers and a self-linked HUD queue marker.
+     * Tear that state down before generic production/revival death cleanup. */
+    if (self->construction.active) G_StopConstruction(self);
+    if (self->training) G_ClearTrainingQueueFood(self);
+    else { G_CancelHeroRevives(self); G_CancelTrainingQueue(self, true); }
+    G_ClearUnitFood(self);
+    if (G_UnitIsHero(self)) {
+        self->revival.awaiting = false;
+        self->revival.reviving = false;
+        self->revival.producer = NULL;
+        self->revival.queue_next = NULL;
+        self->revival.player = 0;
+        self->revival.gold = self->revival.lumber = 0;
+        self->revival.progress = 0.0f;
+    }
+    unit_leavecombat(self);
+    self->selected = 0;
+    self->s.flags |= EF_NOT_SELECTABLE;
+    self->aiflags &= ~AI_HOLD_FRAME;
+    unit_setmove(self, &unit_move_death);
+    if (self->animation) self->s.frame = self->animation->interval[0];
+    if (self->sound.death) {
+        self->sound.world_pending = self->sound.death;
+        self->sound.world_pending_event = EV_DEATH;
+    }
+    /* Destroying a transport ejects its passengers at the wreck. */
+    if (self->cargo.count > 0) {
+        cargo_drop_all(self);
+    }
+    /* EVENT_UNIT_DEATH matches widget-specific death triggers
+     * (TriggerRegisterDeathEvent/UnitEvent); EVENT_PLAYER_UNIT_DEATH fires the
+     * owner's player-unit-death triggers (TriggerRegisterPlayerUnitEvent), e.g.
+     * the mission win check that counts the player's dying naga. */
+    G_PublishEventWithSource(self, EVENT_UNIT_DEATH, attacker);
+    G_PublishEventWithSource(self, EVENT_PLAYER_UNIT_DEATH, attacker);
+    self->svflags |= SVF_DEADMONSTER;
+    S_ReincarnationOnDeath(self);
+    /* Static building footprints are baked into pathmap.original. Rebuild after
+     * the death flag becomes authoritative so destroyed/cancelled structures
+     * stop blocking routes immediately. */
+    if (G_UnitIsBuilding(self->class_id)) CM_BakeStaticObstacles();
+    G_InvalidateRallyTarget(self);
+    /* A dead producer cannot retain ownership of a revival.  This clears each
+     * Hero's reviving flag and refunds what this Altar charged. */
+    G_CancelHeroRevives(self);
+    if (self->s.flags & EF_FOW_BLOCKER) G_FowMarkBlockersDirty();
+    /* Award experience to the killer's nearby heroes (enemy kills only). */
+    if (attacker && attacker != self && attacker->s.player != self->s.player) {
+        G_GrantKillXP(self, attacker);
+    }
+    /* Corpses stop being selection members immediately. Mirror that server
+     * mutation to each connected client that had this unit selected; otherwise
+     * the packed multiselect layer and local current-selection cache can retain
+     * a dead icon until another explicit selection occurs. */
+    FOR_LOOP(i, game.max_clients) {
+        LPGAMECLIENT client = game.clients + i;
+        if (client->connected && client->ps.number < MAX_PLAYERS &&
+            (selected_mask & (1u << client->ps.number)))
+            G_SyncClientSelection(client);
+    }
+
+    owner = G_GetPlayerClientByNumber(self->s.player);
+    if (owner && owner->ps.number == self->s.player &&
+        (!owner->connected || owner->ps.number >= MAX_PLAYERS ||
+         !(selected_mask & (1u << owner->ps.number))))
+        G_InvalidateCommands(owner);
+}
+
+void unit_birth(LPEDICT self) {
+    unit_setmove(self, &unit_move_birth);
+    self->wait = self->data.UnitBalance->buildTime;
+    self->s.renderfx |= RF_NO_UBERSPLAT;
+}
+
+static BOOL unit_smart_target_is_enemy(LPEDICT self, LPEDICT target) {
+    DWORD owner;
+
+    if (!self || !target || self->s.player >= MAX_PLAYERS || target->s.player >= MAX_PLAYERS) {
+        return false;
+    }
+    owner = target->s.player;
+    if (owner == self->s.player) {
+        return false;
+    }
+    if (owner < PLAYER_NEUTRAL_AGGRESSIVE && level.mapinfo &&
+        level.mapinfo->players[owner].playerType == kPlayerTypeNone) {
+        return false;
+    }
+    return !G_PlayerTreatsPlayerAsAlly(self->s.player, owner);
+}
+
+static BOOL unit_smart_target_is_followable(LPEDICT self, LPEDICT target) {
+    DWORD owner;
+
+    if (!self || !target || self->s.player >= MAX_PLAYERS || target->s.player >= MAX_PLAYERS) {
+        return false;
+    }
+    owner = target->s.player;
+    if (owner == self->s.player) {
+        return true;
+    }
+    if (owner < PLAYER_NEUTRAL_AGGRESSIVE && level.mapinfo &&
+        level.mapinfo->players[owner].playerType == kPlayerTypeNone) {
+        return false;
+    }
+    return G_PlayerTreatsPlayerAsAlly(self->s.player, owner);
+}
+
+static BOOL unit_order_name_valid(LPCSTR order) {
+    return order && *order && strlen(order) < UNIT_ORDER_NAME_SIZE;
+}
+
+/* The current OrderId native still uses the historical class_id/FourCC
+ * conversion. Keep issued-order event ids on that same contract for now so
+ * campaign conditions comparing GetIssuedOrderId() with OrderId("smart")
+ * agree without changing the wider numeric-order API in this compatibility
+ * fix. */
+static DWORD issued_order_ids[MAX_ENTITIES];
+static VECTOR2 issued_order_points[MAX_ENTITIES];
+static BOOL issued_order_point_valid[MAX_ENTITIES];
+
+static DWORD unit_order_event_id(LPCSTR order) {
+    DWORD id = 0;
+    if (!order) return 0;
+    memcpy(&id, order, MIN(sizeof(id), strlen(order)));
+    return id;
+}
+
+DWORD G_GetIssuedOrderId(LPCEDICT self) {
+    if (!self || self->s.number >= MAX_ENTITIES) return 0;
+    return issued_order_ids[self->s.number];
+}
+
+BOOL G_GetIssuedOrderPoint(LPCEDICT self, LPVECTOR2 point) {
+    if (point) *point = (VECTOR2){ 0.0f, 0.0f };
+    if (!self || self->s.number >= MAX_ENTITIES || !point ||
+        !issued_order_point_valid[self->s.number]) return false;
+    *point = issued_order_points[self->s.number];
+    return true;
+}
+
+void G_PublishIssuedPointOrder(LPEDICT self, DWORD order_id, LPCVECTOR2 point,
+                               DWORD issuer_player, LPCSTR debug_order) {
+    if (!self || self->s.number >= MAX_ENTITIES || !point) return;
+    issued_order_ids[self->s.number] = order_id;
+    issued_order_points[self->s.number] = *point;
+    issued_order_point_valid[self->s.number] = true;
+    if (WC3_TUTORIAL_DEBUG_ENABLED()) {
+        fprintf(stderr,
+                "WC3_QUEST_ORDER publish event=POINT player=%u unit=%u id=%.4s order=\"%s\" order_id=%u point=(%.1f,%.1f)\n",
+                (unsigned)issuer_player, (unsigned)self->s.number,
+                (LPCSTR)&self->class_id, debug_order ? debug_order : "",
+                (unsigned)order_id, point->x, point->y);
+    }
+    G_PublishEvent(self, EVENT_PLAYER_UNIT_ISSUED_POINT_ORDER);
+    G_PublishEvent(self, EVENT_UNIT_ISSUED_POINT_ORDER);
+}
+
+static void unit_publish_target_order(LPEDICT self, LPCSTR order,
+                                      LPEDICT target, DWORD issuer_player) {
+    DWORD const order_id = unit_order_event_id(order);
+
+    if (!self || self->s.number >= MAX_ENTITIES) return;
+    issued_order_ids[self->s.number] = order_id;
+    issued_order_point_valid[self->s.number] = false;
+    if (WC3_TUTORIAL_DEBUG_ENABLED()) {
+        fprintf(stderr,
+                "WC3_QUEST_ORDER publish event=TARGET player=%u unit=%u id=%.4s order=\"%s\" order_id=%u target=%u target_id=%.4s\n",
+                (unsigned)issuer_player, (unsigned)self->s.number,
+                (LPCSTR)&self->class_id, order ? order : "",
+                (unsigned)order_id, target ? (unsigned)target->s.number : 0u,
+                target ? (LPCSTR)&target->class_id : "----");
+    }
+    G_PublishEventWithSource(self, EVENT_PLAYER_UNIT_ISSUED_TARGET_ORDER, target);
+    G_PublishEventWithSource(self, EVENT_UNIT_ISSUED_TARGET_ORDER, target);
+}
+
+static BOOL unit_has_active_order(LPCEDICT self) {
+    return self && self->currentmove && self->currentmove->ability != NULL &&
+           !move_is_terminal_hold(self);
+}
+
+static BOOL unit_queue_push(LPEDICT self, LPCSTR order, unitOrderTargetType_t target_type,
+                            LPCVECTOR2 point, LPEDICT target, DWORD issuer_player,
+                            FLOAT group_speed) {
+    unitOrderQueue_t *queue;
+    unitOrder_t *queued;
+    DWORD slot;
+
+    if (!self || !unit_order_name_valid(order)) return false;
+    queue = &self->order_queue;
+    if (queue->count >= MAX_UNIT_ORDER_QUEUE) return false;
+    slot = (queue->head + queue->count) % MAX_UNIT_ORDER_QUEUE;
+    queued = &queue->entries[slot];
+    memset(queued, 0, sizeof(*queued));
+    snprintf(queued->order, sizeof(queued->order), "%s", order);
+    queued->target_type = target_type;
+    queued->issuer_player = issuer_player;
+    queued->group_speed = group_speed;
+    if (point) queued->point = *point;
+    if (target) {
+        DWORD const number = target->s.number;
+        if (number >= globals.num_edicts || globals.edicts + number != target) return false;
+        queued->target_number = number;
+        queued->target_spawn_time = target->spawn_time;
+    }
+    queue->count++;
+    return true;
+}
+
+static BOOL unit_queue_pop(LPEDICT self, unitOrder_t *out) {
+    unitOrderQueue_t *queue;
+
+    if (!self || !out) return false;
+    queue = &self->order_queue;
+    if (!queue->count) return false;
+    *out = queue->entries[queue->head];
+    memset(&queue->entries[queue->head], 0, sizeof(queue->entries[queue->head]));
+    queue->head = (queue->head + 1) % MAX_UNIT_ORDER_QUEUE;
+    queue->count--;
+    if (!queue->count) queue->head = 0;
+    return true;
+}
+
+void G_ClearUnitOrderQueue(LPEDICT self) {
+    if (!self) return;
+    memset(&self->order_queue, 0, sizeof(self->order_queue));
+}
+
+DWORD G_UnitQueuedOrderCount(LPCEDICT self) {
+    return self ? self->order_queue.count : 0;
+}
+
+static BOOL unit_issueorder_now(LPEDICT self, LPCSTR order, LPCVECTOR2 point, FLOAT group_speed);
+
+static BOOL unit_issuetargetorder_now(LPEDICT self, LPCSTR order, LPEDICT target) {
+    if (!self || !order || !target) return false;
+    if (M_IsDead(self)) return false;
+    if (S_GoldMineWorkerIsInside(self)) return false;
+
+    self->movement.holding_position = false;
+    if (!strcmp(order, "repair")) {
+        return S_OrderRepair(self, target, 0);
+    }
+    if (!strcmp(order, "smart")) {
+        if (G_IsItem(target)) {
+            return G_OrderPickupItem(self, target);
+        }
+        if (G_ActorHasSkill(self, "Ahar")) {
+            if (S_GoldMineIsMine(target)) {
+                return harvest_gold_order(self, target);
+            }
+            if (target->targtype == TARG_TREE) {
+                harvest_start(self, target);
+                return true;
+            }
+            if (self->harvested_lumber > 0 && harvest_lumber_return_to(self, target))
+                return true;
+            if (self->harvested_gold > 0 && harvest_gold_return_to(self, target))
+                return true;
+        }
+        /* Neutral crates are not enemy units, but they are valid normal-attack
+         * targets.  Trees keep the harvest behavior above for workers. */
+        if (G_IsDestructable(target)) {
+            if (!G_DestructableIsAttackable(target)) {
+                return false;
+            }
+            order_attack(self, target);
+            return true;
+        }
+        if (unit_smart_target_is_enemy(self, target)) {
+            order_attack(self, target);
+            return true;
+        }
+        if (S_RepairSmart(self, target)) {
+            return true;
+        }
+        if ((target->svflags & SVF_MONSTER) && unit_smart_target_is_followable(self, target)) {
+            order_follow(self, target);
+            return self->movement.follow_target == target;
+        }
+        return unit_issueorder_now(self, "move", &target->s.origin2, 0.0f);
+    }
+    if (!strcmp(order, "move") && (target->svflags & SVF_MONSTER)) {
+        order_follow(self, target);
+        return self->movement.follow_target == target;
+    }
+    if (!strcmp(order, "attack")) {
+        if (G_IsDestructable(target) && !G_DestructableIsAttackable(target)) {
+            return false;
+        }
+        order_attack(self, target);
+        return true;
+    }
+    if (!strcmp(order, "militia") || !strcmp(order, "militiaoff")) {
+        return S_MilitiaTargetOrder(self, order, target);
+    }
+    return false;
+}
+
+static BOOL unit_issueorder_now(LPEDICT self, LPCSTR order, LPCVECTOR2 point, FLOAT group_speed) {
+    VECTOR2 target;
+    LPEDICT waypoint;
+
+    if (!self || !order || !point) return false;
+    if (M_IsDead(self)) return false;
+    if (S_GoldMineWorkerIsInside(self)) return false;
+    if (self->aiflags & AI_IMMOBILE) return false;
+
+    target = *point;
+    CM_ClosestPathablePointForRadius(point, self->collision, &target);
+    waypoint = Waypoint_add(&target);
+    if (!waypoint) return false;
+    self->movement.holding_position = false;
+    if (!strcmp(order, "smart") || !strcmp(order, "move")) {
+        order_move(self, waypoint);
+        self->movement.group_speed = group_speed;
+        return true;
+    }
+    if (!strcmp(order, "attack")) {
+        order_attackmove(self, waypoint);
+        return true;
+    }
+    return false;
+}
+
+BOOL G_IssueUnitTargetOrder(LPEDICT self, LPCSTR order, LPEDICT target,
+                            BOOL queue, DWORD issuer_player) {
+    if (!self || !order || !target || !target->inuse || !unit_order_name_valid(order)) return false;
+    if (M_IsDead(self)) return false;
+    /* Rally is producer metadata rather than an interruptible unit behavior. */
+    if (!strcmp(order, "setrally") || (!strcmp(order, "smart") && G_UnitHasRally(self))) {
+        if (!queue) G_ClearUnitOrderQueue(self);
+        return G_SetRallyEntity(self, target);
+    }
+    if (S_GoldMineWorkerIsInside(self)) return false;
+    if (strcmp(order, "smart") && strcmp(order, "move") && strcmp(order, "attack") &&
+        strcmp(order, "repair") && strcmp(order, "militia") && strcmp(order, "militiaoff")) return false;
+
+    if (queue && unit_has_active_order(self)) {
+        BOOL const accepted = unit_queue_push(self, order, UNIT_ORDER_TARGET_ENTITY, NULL, target,
+                                              issuer_player, 0.0f);
+        if (accepted) unit_publish_target_order(self, order, target, issuer_player);
+        return accepted;
+    }
+    if (!queue) G_ClearUnitOrderQueue(self);
+    {
+        BOOL const accepted = unit_issuetargetorder_now(self, order, target);
+        if (accepted) unit_publish_target_order(self, order, target, issuer_player);
+        return accepted;
+    }
+}
+
+BOOL G_IssueUnitPointOrder(LPEDICT self, LPCSTR order, LPCVECTOR2 point,
+                           BOOL queue, DWORD issuer_player, FLOAT group_speed) {
+    if (!self || !order || !point || !unit_order_name_valid(order)) return false;
+    if (M_IsDead(self)) return false;
+    /* Rally-point changes are metadata and apply immediately even when Shift is down. */
+    if (!strcmp(order, "setrally") || (!strcmp(order, "smart") && G_UnitHasRally(self))) {
+        BOOL accepted;
+        if (!queue) G_ClearUnitOrderQueue(self);
+        accepted = G_SetRallyPoint(self, point);
+        if (accepted) {
+            G_PublishIssuedPointOrder(self, unit_order_event_id(order), point,
+                                      issuer_player, order);
+        }
+        return accepted;
+    }
+    if (S_GoldMineWorkerIsInside(self)) return false;
+    if (self->aiflags & AI_IMMOBILE) return false;
+    if (strcmp(order, "smart") && strcmp(order, "move") && strcmp(order, "attack")) return false;
+
+    if (queue && unit_has_active_order(self)) {
+        BOOL const accepted = unit_queue_push(self, order, UNIT_ORDER_TARGET_POINT, point, NULL,
+                                               issuer_player, group_speed);
+        if (accepted) {
+            G_PublishIssuedPointOrder(self, unit_order_event_id(order), point,
+                                      issuer_player, order);
+        }
+        return accepted;
+    }
+    if (!queue) G_ClearUnitOrderQueue(self);
+    {
+        BOOL const accepted = unit_issueorder_now(self, order, point, group_speed);
+        if (accepted) {
+            G_PublishIssuedPointOrder(self, unit_order_event_id(order), point,
+                                      issuer_player, order);
+        }
+        return accepted;
+    }
+}
+
+BOOL G_UnitStartNextQueuedOrder(LPEDICT self) {
+    unitOrder_t queued;
+
+    if (!self || M_IsDead(self)) return false;
+    while (unit_queue_pop(self, &queued)) {
+        if (queued.target_type == UNIT_ORDER_TARGET_POINT) {
+            if (unit_issueorder_now(self, queued.order, &queued.point, queued.group_speed))
+                return true;
+        } else if (queued.target_type == UNIT_ORDER_TARGET_ENTITY) {
+            LPEDICT target;
+            if (queued.target_number >= globals.num_edicts) continue;
+            target = globals.edicts + queued.target_number;
+            if (!target->inuse || target->spawn_time != queued.target_spawn_time) continue;
+            if (unit_issuetargetorder_now(self, queued.order, target)) return true;
+        }
+    }
+    return false;
+}
+
+BOOL unit_issuetargetorder(LPEDICT self, LPCSTR order, LPEDICT target) {
+    return G_IssueUnitTargetOrder(self, order, target, false,
+                                  self ? self->s.player : 0);
+}
+
+BOOL unit_issueorder(LPEDICT self, LPCSTR order, LPCVECTOR2 point) {
+    return G_IssueUnitPointOrder(self, order, point, false,
+                                 self ? self->s.player : 0, 0.0f);
+}
+
+/* Rebind an existing edict to another WC3 unit type while retaining its
+ * authoritative identity and runtime ownership.  Transformation abilities
+ * use this instead of CreateUnit/RemoveUnit so JASS handles, selection, and
+ * trigger references keep pointing at the same unit. */
+BOOL G_TransformUnitType(LPEDICT unit, DWORD type) {
+    LPGAMECLIENT client;
+    FLOAT health_ratio, mana_ratio, temporary_armor;
+    FLOAT temporary_attack1, temporary_attack2;
+    DWORD old_flags;
+
+    if (!unit || !type || !G_UnitUI(type)->modelFile || G_UnitIsBuilding(type)) return false;
+    health_ratio = unit->health.max_value > 0.0f ? unit->health.value / unit->health.max_value : 1.0f;
+    mana_ratio = unit->mana.max_value > 0.0f ? unit->mana.value / unit->mana.max_value : 0.0f;
+    temporary_armor = unit->temporary_armor_bonus;
+    temporary_attack1 = unit->attack1.temporaryDamageBonus;
+    temporary_attack2 = unit->attack2.temporaryDamageBonus;
+    old_flags = unit->s.flags;
+
+    G_ClearUnitFood(unit);
+    if (old_flags & EF_FOW_BLOCKER) G_FowMarkBlockersDirty();
+    unit->class_id = unit->s.class_id = type;
+    G_BindEntityData(unit);
+    unit->s.flags &= ~(EF_BUILDING | EF_FOW_BLOCKER | EF_FOW_REVEALER);
+    unit->aiflags &= ~(AI_FLYING | AI_IMMOBILE);
+    unit->s.shadow = 0;
+    memset(&unit->attack1, 0, sizeof(unit->attack1));
+    memset(&unit->attack2, 0, sizeof(unit->attack2));
+    unit->permanent_armor_bonus = 0.0f;
+    unit->temporary_armor_bonus = 0.0f;
+    SP_SpawnUnit(unit);
+    G_SetHealth(unit, MIN(unit->health.max_value, MAX(0.0f, unit->health.max_value * health_ratio)));
+    unit->mana.value = MIN(unit->mana.max_value, MAX(0.0f, unit->mana.max_value * mana_ratio));
+    unit->temporary_armor_bonus = temporary_armor;
+    unit->armor_value += temporary_armor;
+    unit->attack1.temporaryDamageBonus = temporary_attack1;
+    unit->attack2.temporaryDamageBonus = temporary_attack2;
+    G_ActivateUnitFood(unit);
+    unit->animation = NULL;
+    gi.LinkEntity(unit);
+    client = G_GetPlayerClientByNumber(unit->s.player);
+    if (client && client->ps.number == unit->s.player) G_InvalidateCommands(client);
+    G_InvalidateUnitInfoPanel(unit);
+    G_InvalidateUnitPortrait(unit);
+    G_InvalidateUnitShortcutsForUnit(unit);
+    return true;
+}
+
+typedef struct {
+    DWORD ability_id;
+    LPCSTR ability_name;
+    AbilityData_t const *ability;
+    DWORD base_type;
+    DWORD raven_type;
+} ravenFormData_t;
+
+static BOOL unit_raven_form_data(LPEDICT unit, ravenFormData_t *out) {
+    static struct { DWORD id; LPCSTR name; } const candidates[] = {
+        { MAKEFOURCC('A','m','r','f'), "Amrf" }, /* Medivh Crow Form */
+        { MAKEFOURCC('A','r','a','v'), "Arav" }, /* Druid Storm Crow Form */
+    };
+    ravenFormData_t owned = {0};
+
+    if (!unit || !out) return false;
+    FOR_LOOP(i, sizeof(candidates) / sizeof(candidates[0])) {
+        AbilityData_t const *ability = G_AbilityData(candidates[i].id);
+        DWORD const base_type = ability->level[0].data[0].id;
+        DWORD const raven_type = ability->level[0].unitID;
+        ravenFormData_t current;
+
+        if (!ability->id || !base_type || !raven_type) continue;
+        current = (ravenFormData_t){
+            .ability_id = candidates[i].id,
+            .ability_name = candidates[i].name,
+            .ability = ability,
+            .base_type = base_type,
+            .raven_type = raven_type,
+        };
+        /* Endpoint identity is authoritative for preplaced campaign forms,
+         * which may not expose the transform ability through the runtime skill
+         * list before the map issues unravenform. */
+        if (unit->class_id == base_type || unit->class_id == raven_type) {
+            *out = current;
+            return true;
+        }
+        if (!owned.ability && G_ActorHasSkill(unit, candidates[i].name))
+            owned = current;
+    }
+    if (owned.ability) {
+        *out = owned;
+        return true;
+    }
+    return false;
+}
+
+static BOOL unit_raven_form_order(LPEDICT unit, BOOL raven_form) {
+    ravenFormData_t form = {0};
+    DWORD target_type;
+    LPCSTR order_name = raven_form ? "ravenform" : "unravenform";
+
+    if (!unit_raven_form_data(unit, &form)) {
+        fprintf(stderr,
+                "WC3_RAVEN phase=reject order=%s reason=no-matching-transform-ability class=%.4s\n",
+                order_name, unit ? (LPCSTR)&unit->class_id : "----");
+        return false;
+    }
+    target_type = raven_form ? form.raven_type : form.base_type;
+
+    /* Temporary one-shot diagnostics.  These only fire for ravenform and
+     * unravenform, so the campaign cinematic reproducer stays concise. */
+    fprintf(stderr,
+            "WC3_RAVEN phase=resolve order=%s ent=%u class=%.4s sclass=%.4s model=%u "
+            "ability=%.4s code=%.4s dataA=%.4s unitID=%.4s target=%.4s "
+            "hasAbility=%u props=\"%s\" request=\"%s\" anim=\"%s\" frame=%u "
+            "model_file=\"%s\"\n",
+            order_name,
+            (unsigned)unit->s.number,
+            (LPCSTR)&unit->class_id,
+            (LPCSTR)&unit->s.class_id,
+            (unsigned)unit->s.model,
+            (LPCSTR)&form.ability_id,
+            (LPCSTR)&form.ability->code,
+            (LPCSTR)&form.base_type,
+            (LPCSTR)&form.raven_type,
+            (LPCSTR)&target_type,
+            (unsigned)G_ActorHasSkill(unit, form.ability_name),
+            unit->animation_props,
+            unit->animation_request,
+            unit->animation ? unit->animation->name : "<none>",
+            (unsigned)unit->s.frame,
+            unit->data.UnitUI && unit->data.UnitUI->modelFile
+                ? unit->data.UnitUI->modelFile : "");
+
+    if (unit->class_id == target_type) {
+        fprintf(stderr,
+                "WC3_RAVEN phase=noop order=%s reason=already-target class=%.4s\n",
+                order_name, (LPCSTR)&unit->class_id);
+        return true;
+    }
+    if (raven_form ? unit->class_id != form.base_type : unit->class_id != form.raven_type) {
+        fprintf(stderr,
+                "WC3_RAVEN phase=reject order=%s reason=wrong-source-endpoint class=%.4s\n",
+                order_name, (LPCSTR)&unit->class_id);
+        return false;
+    }
+
+    G_ClearUnitOrderQueue(unit);
+    if (!G_TransformUnitType(unit, target_type)) {
+        fprintf(stderr,
+                "WC3_RAVEN phase=reject order=%s reason=transform-failed target=%.4s\n",
+                order_name, (LPCSTR)&target_type);
+        return false;
+    }
+    fprintf(stderr,
+            "WC3_RAVEN phase=transformed order=%s ent=%u class=%.4s sclass=%.4s model=%u "
+            "props=\"%s\" request=\"%s\" anim=\"%s\" frame=%u model_file=\"%s\"\n",
+            order_name,
+            (unsigned)unit->s.number,
+            (LPCSTR)&unit->class_id,
+            (LPCSTR)&unit->s.class_id,
+            (unsigned)unit->s.model,
+            unit->animation_props,
+            unit->animation_request,
+            unit->animation ? unit->animation->name : "<none>",
+            (unsigned)unit->s.frame,
+            unit->data.UnitUI && unit->data.UnitUI->modelFile
+                ? unit->data.UnitUI->modelFile : "");
+
+    unit->goalentity = NULL;
+    unit->secondarygoal = NULL;
+    move_reset_progress(unit);
+    unit_stand(unit);
+    /* Cinematics can keep transformed units paused.  Paused units skip
+     * M_MoveFrame(), so snap directly to the destination form's sequence. */
+    if (unit->animation) unit->s.frame = unit->animation->interval[0];
+
+    fprintf(stderr,
+            "WC3_RAVEN phase=final order=%s ent=%u class=%.4s sclass=%.4s model=%u "
+            "props=\"%s\" request=\"%s\" anim=\"%s\" interval=%u..%u frame=%u "
+            "model_file=\"%s\"\n",
+            order_name,
+            (unsigned)unit->s.number,
+            (LPCSTR)&unit->class_id,
+            (LPCSTR)&unit->s.class_id,
+            (unsigned)unit->s.model,
+            unit->animation_props,
+            unit->animation_request,
+            unit->animation ? unit->animation->name : "<none>",
+            unit->animation ? (unsigned)unit->animation->interval[0] : 0u,
+            unit->animation ? (unsigned)unit->animation->interval[1] : 0u,
+            (unsigned)unit->s.frame,
+            unit->data.UnitUI && unit->data.UnitUI->modelFile
+                ? unit->data.UnitUI->modelFile : "");
+    return true;
+}
+
+BOOL unit_issueimmediateorder(LPEDICT self, LPCSTR order) {
+//    printf("%.4s %s\n", &self->class_id, order);
+    if (!self || !order) {
+        return false;
+    }
+    if (M_IsDead(self)) return false;
+    if (S_GoldMineWorkerIsInside(self))
+        return false;
+    if (!strcmp(order, "stop")) {
+        G_ClearUnitOrderQueue(self);
+        order_stop(self);
+        return true;
+    }
+    if (!strcmp(order, "holdposition"))
+        return S_HoldPosition(self);
+    if (!strcmp(order, "mirrorimage"))
+        return S_CastNoTargetSpell(self, MAKEFOURCC('A', 'O', 'm', 'i'));
+    if (!strcmp(order, "avatar"))
+        return S_CastNoTargetSpell(self, MAKEFOURCC('A', 'H', 'a', 'v'));
+    if (!strcmp(order, "ravenform"))
+        return unit_raven_form_order(self, true);
+    if (!strcmp(order, "unravenform"))
+        return unit_raven_form_order(self, false);
+    if (!strcmp(order, "repairon"))
+        return S_SetRepairAutocast(self, true);
+    if (!strcmp(order, "repairoff"))
+        return S_SetRepairAutocast(self, false);
+    if (!strcmp(order, "autoharvestgold"))
+        return harvest_auto_start_gold(self);
+    if (!strcmp(order, "autoharvestlumber"))
+        return harvest_auto_start_lumber(self);
+    return false;
+}
+
+LPEDICT 
+unit_createorfind(DWORD player,
+                  DWORD unitid,
+                  LPCVECTOR2 location,
+                  FLOAT facing) 
+{
+    FOR_LOOP(i, globals.num_edicts) {
+        LPEDICT ent = &globals.edicts[i];
+        if (ent->class_id == unitid &&
+            Vector2_distance(location, &ent->s.origin2) < 10)
+        {
+            G_SetUnitPlayer(ent, player);
+            ent->s.angle = facing * M_PI / 180;
+            G_ActivateUnitFood(ent);
+            return ent;
+        }
+    }
+    LPEDICT unit = SP_SpawnAtLocation(unitid, player, location);
+//    printf("%.4s\n", &unit->class_id);
+    if (!unit) {
+        return NULL;
+    }
+    if (unit->stand) {
+        unit->stand(unit);
+    }
+    unit->s.angle = facing * M_PI / 180;;
+    G_ActivateUnitFood(unit);
+    return unit;
+}
+
+BOOL unit_additemtoslot(LPEDICT edict, LPEDICT item, DWORD i) {
+    return G_AddItemToSlot(edict, item, i);
+}
+
+BOOL unit_additem(LPEDICT edict, LPEDICT item) {
+    return G_PickupItem(edict, item);
+}
+
+static int unit_timed_status_debug_level(void) {
+    LPCSTR value;
+
+    value = gi.CvarString("wc3_timed_status_debug", "0");
+    return value ? atoi(value) : 0;
+}
+
+static void unit_timed_status_log(LPCSTR stage, LPCEDICT ent, heroabilitystatus_t const *status) {
+    char code[5] = { 0 };
+    DWORD now;
+    LONG remaining;
+
+    if (unit_timed_status_debug_level() < 1 || !ent || !status ||
+        !unit_statusshowstimedbar(status->code))
+    {
+        return;
+    }
+    now = G_Time();
+    remaining = status->timestamp > now ? (LONG)(status->timestamp - now) : 0;
+    memcpy(code, &status->code, 4);
+    fprintf(stderr,
+            "WC3_TIMED_STATUS sim stage=%s unit=%u code=%s level=%u now=%u timestamp=%u duration_ms=%u remaining_ms=%ld fraction=%.4f\n",
+            stage ? stage : "?", (unsigned)ent->s.number, code,
+            (unsigned)status->level, (unsigned)now, (unsigned)status->timestamp,
+            (unsigned)status->duration_ms, (long)remaining,
+            unit_statusremainingfraction(status));
+}
+
+static BOOL unit_status_stuns(DWORD code) {
+    return code == MAKEFOURCC('B', 's', 't', 'u') || code == MAKEFOURCC('B', 'U', 's', 'l');
+}
+
+static BOOL unit_status_timedlife(DWORD code) {
+    return code == MAKEFOURCC('B', 'T', 'L', 'F');
+}
+
+BOOL unit_statusshowstimedbar(DWORD code) {
+    return code == MAKEFOURCC('B', 'T', 'L', 'F') ||
+           code == MAKEFOURCC('B', 'm', 'i', 'l');
+}
+
+FLOAT unit_statusremainingfraction(heroabilitystatus_t const *status) {
+    DWORD now;
+
+    if (!status || !status->level || !status->timestamp || !status->duration_ms) {
+        return 0.0f;
+    }
+    now = G_Time();
+    if (now >= status->timestamp) {
+        return 0.0f;
+    }
+    return MIN(1.0f, (FLOAT)(status->timestamp - now) / (FLOAT)status->duration_ms);
+}
+
+heroabilitystatus_t const *unit_findtimedbarstatus(LPCEDICT ent) {
+    heroabilitystatus_t const *result = NULL;
+    DWORD now;
+
+    if (!ent) return NULL;
+    now = G_Time();
+    FOR_LOOP(i, MAX_UNIT_STATUSES) {
+        heroabilitystatus_t const *status = ent->abilstatus + i;
+        if (!status->level || !status->timestamp || !status->duration_ms) continue;
+        if (status->timestamp <= now || !unit_statusshowstimedbar(status->code)) continue;
+        /* Warsmash owns one timed-status slot; later qualifying buffs replace
+         * earlier ones during status population. Preserve that deterministic
+         * single-slot behavior using abilstatus[] order. */
+        result = status;
+    }
+    return result;
+}
+
+FLOAT G_UnitArmorValue(LPCEDICT ent) {
+    FLOAT armor;
+
+    if (!ent) return 0.0f;
+    armor = ent->armor_value;
+
+    /* Bdef is the stock Scroll of Protection status. Keep the authored armor
+     * amount in AbilityData (AIda/DataA) rather than baking it into the unit or
+     * status record; status expiry then removes the bonus automatically from
+     * both combat and HUD calculations without adding save-state fields. */
+    FOR_LOOP(i, MAX_UNIT_STATUSES) {
+        heroabilitystatus_t const *status = ent->abilstatus + i;
+        if (status->level && status->code == MAKEFOURCC('B', 'd', 'e', 'f')) {
+            DWORD level = MAX(1, MIN(status->level, 4));
+            AbilityData_t const *ability = G_AbilityData(MAKEFOURCC('A', 'I', 'd', 'a'));
+            armor += ability->level[level - 1].data[0].number;
+        }
+    }
+    return armor + S_SpikedArmorBonus(ent) + S_HumanArmorBonus(ent);
+}
+
+static void unit_refreshstatusflags(LPEDICT ent) {
+    ent->stunned = false;
+    FOR_LOOP(i, MAX_UNIT_STATUSES) {
+        heroabilitystatus_t *status = ent->abilstatus + i;
+        if (status->level && unit_status_stuns(status->code)) {
+            ent->stunned = true;
+        }
+    }
+}
+
+void unit_updatestatuses(LPEDICT ent) {
+    DWORD now = G_Time();
+    BOOL changed = false;
+    BOOL kill = false;
+    BOOL militia_expired = false;
+
+    FOR_LOOP(i, MAX_UNIT_STATUSES) {
+        heroabilitystatus_t *status = ent->abilstatus + i;
+        if (!status->level || !status->timestamp) {
+            continue;
+        }
+        if (now >= status->timestamp) {
+            if (unit_status_timedlife(status->code)) {
+                kill = true;
+            }
+            if (status->code == MAKEFOURCC('B', 'O', 'w', 'k')) {
+                ent->s.renderfx &= ~RF_HIDDEN;
+            }
+            S_HumanStatusExpired(ent, status->code, status->level);
+            if (status->code == MAKEFOURCC('B', 'm', 'i', 'l')) {
+                militia_expired = true;
+            }
+            unit_timed_status_log("expire", ent, status);
+            memset(status, 0, sizeof(*status));
+            changed = true;
+        }
+    }
+    if (changed) {
+        unit_refreshstatusflags(ent);
+        G_InvalidateUnitInfoPanel(ent);
+    }
+    if (militia_expired && !M_IsDead(ent)) {
+        S_MilitiaExpire(ent);
+    }
+    if (kill && !M_IsDead(ent)) {
+        G_SetHealth(ent, 0);
+        if (ent->die) {
+            ent->die(ent, ent->owner);
+        }
+    }
+}
+
+void unit_addtimedstatus(LPEDICT ent, LPCSTR skill, DWORD level, FLOAT duration) {
+    DWORD code;
+    DWORD now;
+    DWORD duration_ms;
+    heroabilitystatus_t *slot = NULL;
+    LPCSTR stacktype;
+
+    if (!ent || !skill || !*skill || level == 0) {
+        return;
+    }
+
+    code = *((DWORD const *)skill);
+    now = G_Time();
+    duration_ms = duration > 0.0f ? (DWORD)(duration * 1000.0f) : 0;
+    stacktype = S_SpellString(code, "BuffStackType", 0);
+
+    FOR_LOOP(i, MAX_UNIT_STATUSES) {
+        heroabilitystatus_t *status = ent->abilstatus + i;
+        if (status->level && status->code == code) {
+            /* Existing buff of same code found — apply stacking rule. */
+            if (stacktype && !strcmp(stacktype, "Stack")) {
+                status->level += level;
+                if (duration_ms) {
+                    status->timestamp = now + duration_ms;
+                    status->duration_ms = duration_ms;
+                }
+            } else if (stacktype && !strcmp(stacktype, "Refresh")) {
+                if (duration_ms) {
+                    status->timestamp = now + duration_ms;
+                    status->duration_ms = duration_ms;
+                }
+            } else {
+                /* "Replace" (default): overwrite level and timestamp. */
+                status->level = level;
+                if (duration_ms) {
+                    status->timestamp = now + duration_ms;
+                    status->duration_ms = duration_ms;
+                } else {
+                    status->timestamp = 0;
+                    status->duration_ms = 0;
+                }
+            }
+            unit_refreshstatusflags(ent);
+            unit_timed_status_log("refresh", ent, status);
+            G_InvalidateUnitInfoPanel(ent);
+            return;
+        }
+        if (!status->level && !slot) {
+            slot = status;
+        }
+    }
+    if (!slot) {
+        return;
+    }
+
+    slot->code = code;
+    slot->level = level;
+    slot->timestamp = duration_ms ? now + duration_ms : 0;
+    slot->duration_ms = duration_ms;
+    unit_refreshstatusflags(ent);
+    unit_timed_status_log("add", ent, slot);
+    G_InvalidateUnitInfoPanel(ent);
+}
+
+void unit_addstatus(LPEDICT ent, LPCSTR skill, DWORD level) {
+    unit_addtimedstatus(ent, skill, level, 0);
+}
+
+DWORD G_UnitStatusLevel(LPCEDICT ent, DWORD code) {
+    if (!ent || !code) return 0;
+    FOR_LOOP(i, MAX_UNIT_STATUSES)
+        if (ent->abilstatus[i].level && ent->abilstatus[i].code == code &&
+            (!ent->abilstatus[i].timestamp || ent->abilstatus[i].timestamp > G_Time()))
+            return ent->abilstatus[i].level;
+    return 0;
+}
+
+static heroability_t *G_FindRuntimeAbility(LPEDICT ent, DWORD abilcode) {
+    if (!ent || !abilcode) {
+        return NULL;
+    }
+    FOR_LOOP(i, MAX_HERO_ABILITIES) {
+        heroability_t *ha = ent->heroabilities + i;
+        if (ha->level && ha->code == abilcode) {
+            return ha;
+        }
+    }
+    return NULL;
+}
+
+static BOOL G_FourCCListContains(LPCSTR list, DWORD code) {
+    LPCSTR cursor = list;
+
+    if (!list || !code) {
+        return false;
+    }
+    while (*cursor) {
+        LPCSTR start;
+        LPCSTR end;
+        DWORD item = 0;
+
+        while (*cursor == ',' || isspace((unsigned char)*cursor)) cursor++;
+        if (!*cursor) break;
+        start = cursor;
+        while (*cursor && *cursor != ',') cursor++;
+        end = cursor;
+        while (end > start && isspace((unsigned char)end[-1])) end--;
+        if ((size_t)(end - start) == sizeof(item)) {
+            memcpy(&item, start, sizeof(item));
+            if (item == code) return true;
+        }
+        if (*cursor == ',') cursor++;
+    }
+    return false;
+}
+
+static DWORD G_HeroSkillLevel(LPCEDICT ent, DWORD abilcode) {
+    if (!ent || !abilcode) {
+        return 0;
+    }
+    FOR_LOOP(i, MAX_HERO_ABILITIES) {
+        heroability_t const *ha = ent->heroabilities + i;
+        if (ha->level && ha->code == abilcode) {
+            return ha->level;
+        }
+    }
+    return 0;
+}
+
+void G_HeroInitializeProgression(LPEDICT ent) {
+    DWORD spent_points = 0;
+
+    if (!ent) {
+        return;
+    }
+    if (ent->hero.level == 0) {
+        ent->hero.level = 1;
+    }
+    FOR_LOOP(i, MAX_HERO_ABILITIES) {
+        spent_points += ent->heroabilities[i].level;
+    }
+    if (!ent->hero.skillpoints && ent->hero.level > spent_points) {
+        ent->hero.skillpoints = ent->hero.level - spent_points;
+    }
+}
+
+BOOL G_HeroModifySkillPoints(LPEDICT ent, LONG delta) {
+    DWORD old_points;
+    DWORD new_points;
+    LPGAMECLIENT owner;
+
+    if (!ent || !ent->data.UnitBalance || !G_UnitIsHero(ent)) {
+        return false;
+    }
+
+    old_points = ent->hero.skillpoints;
+    if (delta < 0) {
+        unsigned long long const remove = (unsigned long long)(-(long long)delta);
+        if (!old_points) {
+            return false;
+        }
+        new_points = remove >= old_points ? 0 : old_points - (DWORD)remove;
+    } else if (delta > 0) {
+        unsigned long long const sum = (unsigned long long)old_points + (unsigned long long)(DWORD)delta;
+        new_points = sum > (unsigned long long)INT32_MAX ? (DWORD)INT32_MAX : (DWORD)sum;
+    } else {
+        new_points = old_points;
+    }
+
+    ent->hero.skillpoints = new_points;
+    owner = G_GetPlayerClientByNumber(ent->s.player);
+    if (new_points != old_points && owner && owner->ps.number == ent->s.player) {
+        G_InvalidateCommands(owner);
+    }
+    return true;
+}
+
+DWORD G_UnitAbilityLevel(LPCEDICT ent, DWORD abilcode) {
+    DWORD const hero_level = G_HeroSkillLevel(ent, abilcode);
+    if (hero_level) {
+        return hero_level;
+    }
+    if (ent && ent->data.UnitAbilities && G_FourCCListContains(ent->data.UnitAbilities->abilList, abilcode)) {
+        return 1;
+    }
+    return 0;
+}
+
+void unit_learnability(LPEDICT ent, DWORD abilcode) {
+    heroability_t *existing = G_FindRuntimeAbility(ent, abilcode);
+    if (existing) {
+        existing->level++;
+        return;
+    }
+    FOR_LOOP(i, MAX_HERO_ABILITIES) {
+        heroability_t *ha = ent->heroabilities + i;
+        if (ha->level == 0) {
+            ha->level = 1;
+            ha->code = abilcode;
+            return;
+        }
+    }
+}
+
+static DWORD G_HeroAbilityLevelSkip(void) {
+    LPCSTR const value = Stb_IniCacheFind(&game.config.misc, "Misc", "HeroAbilityLevelSkip");
+    DWORD const skip = value ? (DWORD)atoi(value) : 0;
+    return skip > 0 ? skip : 2;
+}
+
+BOOL G_HeroHasCandidateSkill(LPCEDICT ent, DWORD abilcode) {
+    if (!ent || !G_UnitIsHero(ent) || !ent->data.UnitAbilities || !abilcode) {
+        return false;
+    }
+    return G_FourCCListContains(ent->data.UnitAbilities->heroAbilList, abilcode);
+}
+
+DWORD G_HeroSkillRequiredLevel(LPEDICT ent, DWORD abilcode) {
+    AbilityData_t const *ability = G_AbilityData(abilcode);
+    DWORD const current = G_HeroSkillLevel(ent, abilcode);
+    DWORD const base = ability->reqLevel > 0 ? (DWORD)ability->reqLevel : 1;
+    DWORD const skip = ability->levelSkip > 0 ? (DWORD)ability->levelSkip : G_HeroAbilityLevelSkip();
+    return base + current * skip;
+}
+
+heroSkillState_t G_HeroSkillState(LPEDICT ent, DWORD abilcode, DWORD *next_level, DWORD *required_level) {
+    AbilityData_t const *ability;
+    DWORD current;
+    DWORD required;
+
+    if (next_level) *next_level = 0;
+    if (required_level) *required_level = 0;
+    if (!G_HeroHasCandidateSkill(ent, abilcode)) {
+        return HERO_SKILL_ABSENT;
+    }
+
+    ability = G_AbilityData(abilcode);
+    if (!ability->id || ability->levels <= 0) {
+        return HERO_SKILL_ABSENT;
+    }
+    current = G_HeroSkillLevel(ent, abilcode);
+    if (next_level) *next_level = current + 1;
+    if (current >= (DWORD)ability->levels) {
+        return HERO_SKILL_MAXED;
+    }
+    if (!ent->hero.skillpoints) {
+        return HERO_SKILL_NO_POINTS;
+    }
+
+    required = G_HeroSkillRequiredLevel(ent, abilcode);
+    if (required_level) *required_level = required;
+    if (ent->hero.level < required) {
+        return HERO_SKILL_LEVEL_LOCKED;
+    }
+    return HERO_SKILL_AVAILABLE;
+}
+
+BOOL G_HeroLearnSkill(LPEDICT ent, DWORD abilcode) {
+    DWORD const old_level = G_HeroSkillLevel(ent, abilcode);
+
+    if (G_HeroSkillState(ent, abilcode, NULL, NULL) != HERO_SKILL_AVAILABLE) {
+        return false;
+    }
+    unit_learnability(ent, abilcode);
+    if (G_HeroSkillLevel(ent, abilcode) != old_level + 1) {
+        return false;
+    }
+    if (!G_HeroModifySkillPoints(ent, -1)) {
+        return false;
+    }
+    return true;
+}
+
+/* WC3 hero attribute -> derived-stat bonuses.  Per-point constants are taken
+ * exactly from UnitBalance.slk (consistent across every hero): +25 max HP per
+ * Strength, +15 max mana per Intelligence, +0.3 armor per Agility.  The unit's
+ * realHP/realM/realdef columns are precomputed at the hero's BASE attributes,
+ * so we add the delta for the hero's current attributes.  Current HP/mana move
+ * with the max (gaining Strength heals by the HP gained; losing attributes
+ * cannot drop a living hero below 1 HP).  Non-heroes (no attributes) are a
+ * no-op.  Call whenever a hero's str/agi/intel change. */
+void G_RecomputeHeroStats(LPEDICT ent) {
+    UnitBalance_t const *balance = ent->data.UnitBalance;
+    LONG const baseStr = balance->strength;
+    LONG const baseAgi = balance->agility;
+    LONG const baseInt = balance->intelligence;
+    if (baseStr <= 0 && baseAgi <= 0 && baseInt <= 0) {
+        return;
+    }
+    FLOAT const newMaxHP = balance->maxHealth + ((LONG)ent->hero.str - baseStr) * 25.0f + ent->temporary_health_bonus;
+    FLOAT const newMaxMana = balance->maxMana + ((LONG)ent->hero.intel - baseInt) * 15.0f;
+    FLOAT const agiDefenseBonus = game.constants.combatConstantsLoaded
+                                ? game.constants.agiDefenseBonus
+                                : 0.3f;
+    FLOAT const newArmor = balance->armor + ((LONG)ent->hero.agi - baseAgi) * agiDefenseBonus;
+
+    BOOL const alive = ent->health.value > 0.0f;
+    FLOAT const dHP = newMaxHP - ent->health.max_value;
+    ent->health.max_value = MAX(1.0f, newMaxHP);
+    G_AddHealth(ent, dHP);
+    if (alive && ent->health.value < 1.0f) {
+        G_SetHealth(ent, 1.0f);
+    }
+
+    FLOAT const dMana = newMaxMana - ent->mana.max_value;
+    ent->mana.max_value = MAX(0.0f, newMaxMana);
+    ent->mana.value = MAX(0.0f, MIN(ent->mana.max_value, ent->mana.value + dMana));
+
+    ent->armor_value = newArmor + ent->permanent_armor_bonus + ent->temporary_armor_bonus;
+
+    /* Warsmash applies Misc.StrAttackBonus to whichever attribute is primary.
+     * OpenRealm does not yet split hero base-vs-bonus attributes, so the current
+     * primary value remains in the permanent displayed range; attack/item
+     * bonuses themselves are kept separate below. */
+    {
+        LPCSTR const prim = balance->primaryAttribute;
+        DWORD primVal = ent->hero.str;
+        FLOAT const strAttackBonus = game.constants.combatConstantsLoaded
+                                   ? game.constants.strAttackBonus
+                                   : 1.0f;
+        LONG primaryDamage;
+        if (prim) {
+            if (!strcmp(prim, "AGI")) primVal = ent->hero.agi;
+            else if (!strcmp(prim, "INT")) primVal = ent->hero.intel;
+        }
+        primaryDamage = (LONG)((FLOAT)primVal * strAttackBonus);
+        if (ent->data.UnitWeapons) {
+            ent->attack1.damageBase = (DWORD)MAX(0,
+                (LONG)ent->data.UnitWeapons->attack1.damageBase + primaryDamage
+                + (LONG)ent->attack1.permanentDamageBonus);
+            ent->attack2.damageBase = (DWORD)MAX(0,
+                (LONG)ent->data.UnitWeapons->attack2.damageBase + primaryDamage
+                + (LONG)ent->attack2.permanentDamageBonus);
+        }
+    }
+}
+
+/* ---- Hero experience / leveling (verified against WC3/Warsmash data flow) ---
+ * - Max level: Misc/MaxHeroLevel gameplay constant (default 10).
+ * - XP to REACH level L: sum the per-level Misc/NeedHeroXP table, extending it
+ *   with NeedHeroXPFormulaA/B/C when the authored list is exhausted. Stock data
+ *   yields L1=0, L2=200, L3=500, L4=900, L10=5400.
+ * - Attributes are derived live from level, not stored per level-up: each
+ *   primary attribute = base + trunc((level-1) * perLevelGain).  The product is
+ *   TRUNCATED toward zero (the binary's attribute getter converts the float via
+ *   a bare float->int, no rounding) — a (LONG) cast matches that exactly.
+ * - SetHeroLevel works by granting enough XP to reach the level; XP is the
+ *   source of truth and level only ever increases. */
+DWORD G_MaxHeroLevel(void) {
+    LPCSTR const v = Stb_IniCacheFind(&game.config.misc, "Misc", "MaxHeroLevel");
+    DWORD const m = v ? (DWORD)atoi(v) : 0;
+    return m > 0 ? m : 10;
+}
+
+/* Warcraft stores NeedHeroXP as the XP required for each next level, not as
+ * cumulative XP.  When the authored list runs out, MiscGame extends it with
+ * f(i) = A*f(i-1) + B*i + C, where i is the zero-based table index used by
+ * Warsmash's CGameplayConstants parser. */
+static DWORD G_HeroXPRequirement(DWORD index) {
+    LPCSTR value = Stb_IniCacheFind(&game.config.misc, "Misc", "NeedHeroXP");
+    DWORD current = 0;
+    DWORD count = 0;
+
+    /* When Misc data is unavailable, use the stock per-level sequence directly:
+     * 200, 300, 400, ... .  Do not feed a synthetic single 200 entry through
+     * the extension recurrence; doing that with A=1/B=100 produces
+     * 200,300,500,... and breaks the canonical cumulative thresholds. */
+    if (!value || !*value) {
+        unsigned long long const stock = (unsigned long long)200 + (unsigned long long)100 * index;
+        return stock > (unsigned long long)UINT32_MAX ? UINT32_MAX : (DWORD)stock;
+    }
+
+    while (*value) {
+        char *end = NULL;
+        double parsed;
+        while (*value == ' ' || *value == '\t') value++;
+        parsed = strtod(value, &end);
+        if (!end || end == value) break;
+        if (parsed < 0.0) parsed = 0.0;
+        if (parsed > (double)UINT32_MAX) parsed = (double)UINT32_MAX;
+        current = (DWORD)parsed;
+        if (count++ == index) return current;
+        value = end;
+        while (*value == ' ' || *value == '\t') value++;
+        if (*value == ',') value++;
+        else if (*value) break;
+    }
+    if (!count) {
+        unsigned long long const stock = (unsigned long long)200 + (unsigned long long)100 * index;
+        return stock > (unsigned long long)UINT32_MAX ? UINT32_MAX : (DWORD)stock;
+    }
+    if (index < count) return current;
+
+    {
+        LPCSTR aText = Stb_IniCacheFind(&game.config.misc, "Misc", "NeedHeroXPFormulaA");
+        LPCSTR bText = Stb_IniCacheFind(&game.config.misc, "Misc", "NeedHeroXPFormulaB");
+        LPCSTR cText = Stb_IniCacheFind(&game.config.misc, "Misc", "NeedHeroXPFormulaC");
+        double const a = (aText && *aText) ? atof(aText) :
+            1.0; /* BZ_HARDCODED_DATA_FALLBACK: stock NeedHeroXP formula A. */
+        double const b = (bText && *bText) ? atof(bText) :
+            100.0; /* BZ_HARDCODED_DATA_FALLBACK: stock NeedHeroXP formula B. */
+        double const c = (cText && *cText) ? atof(cText) :
+            0.0; /* BZ_HARDCODED_DATA_FALLBACK: stock NeedHeroXP formula C. */
+        for (DWORD i = count; i <= index; i++) {
+            double next = a * (double)current + b * (double)i + c;
+            if (next < 0.0) next = 0.0;
+            if (next > (double)UINT32_MAX) next = (double)UINT32_MAX;
+            current = (DWORD)next;
+        }
+    }
+    return current;
+}
+
+DWORD G_HeroXPForLevel(DWORD level) {
+    DWORD total = 0;
+    if (level <= 1) return 0;
+
+    for (DWORD i = 0; i < level - 1; i++) {
+        DWORD const need = G_HeroXPRequirement(i);
+        if (UINT32_MAX - total < need) return UINT32_MAX;
+        total += need;
+    }
+    return total;
+}
+
+DWORD G_HeroLevelForXP(DWORD xp) {
+    DWORD const maxLevel = G_MaxHeroLevel();
+    DWORD level = 1;
+    while (level < maxLevel && xp >= G_HeroXPForLevel(level + 1)) {
+        level++;
+    }
+    return level;
+}
+
+/* Set a hero's level and derive its attributes + HP/mana/armor for that level. */
+void G_HeroApplyLevel(LPEDICT ent, DWORD level) {
+    UnitBalance_t const *balance = ent->data.UnitBalance;
+    LONG const baseStr = balance->strength;
+    LONG const baseAgi = balance->agility;
+    LONG const baseInt = balance->intelligence;
+    if (baseStr <= 0 && baseAgi <= 0 && baseInt <= 0) {
+        return; /* not a hero */
+    }
+    if (level < 1) level = 1;
+    if (level > G_MaxHeroLevel()) level = G_MaxHeroLevel();
+
+    FLOAT const steps = (FLOAT)(level - 1);
+    ent->hero.level = level;
+    ent->hero.str = (DWORD)MAX(0, baseStr + (LONG)(steps * balance->strengthPerLevel));
+    ent->hero.agi = (DWORD)MAX(0, baseAgi + (LONG)(steps * balance->agilityPerLevel));
+    ent->hero.intel = (DWORD)MAX(0, baseInt + (LONG)(steps * balance->intelligencePerLevel));
+    G_RecomputeHeroStats(ent);
+}
+
+/* Update a hero's accumulated XP, leveling it up if a threshold was crossed. */
+void G_HeroSetXP(LPEDICT ent, DWORD xp) {
+    DWORD const oldLevel = ent->hero.level;
+    DWORD newLevel;
+
+    /* Retail/Warsmash SetHeroXP is raise-only: a lower requested XP value does
+     * not reduce either XP or level.  Keeping that rule in the shared mutation
+     * path also prevents internally inconsistent high-level/low-XP states. */
+    if (xp <= ent->hero.xp) {
+        return;
+    }
+    ent->hero.xp = xp;
+    newLevel = G_HeroLevelForXP(xp);
+    if (newLevel > oldLevel) {
+        /* WC3 exposes both player-unit and unit-specific Hero level events.
+         * Queue both once for every crossed level; GetLevelingUnit resolves to
+         * the same hero through the ordinary event context. */
+        for (DWORD lv = oldLevel + 1; lv <= newLevel; lv++) {
+            G_HeroApplyLevel(ent, lv);
+            G_HeroModifySkillPoints(ent, 1);
+            G_PublishEvent(ent, EVENT_PLAYER_HERO_LEVEL);
+            G_PublishEvent(ent, EVENT_UNIT_HERO_LEVEL);
+        }
+    }
+}
+
+/* --- XP-on-kill (data-driven from Units\MiscGame.txt) ------------------------
+ * Constants read live from config.misc so map overrides stay 1:1; fallbacks are
+ * the WC3 1.29 defaults: HeroExpRange=1200 (XP-share radius), GrantNormalXP=25 +
+ * GrantNormalXPFormulaB=5/level (base XP by victim level), GrantHeroXP list
+ * 100,120,160,220,300 (heroes), HeroFactorXP=80,70,60,50,0 (diminishing % when
+ * the hero outlevels the victim by N), BuildingKillsGiveExp=0. */
+static FLOAT G_MiscNum(LPCSTR key, FLOAT fallback) {
+    LPCSTR const v = Stb_IniCacheFind(&game.config.misc, "Misc", key);
+    return (v && *v) ? (FLOAT)atof(v) : fallback;
+}
+
+/* n-th (0-based) comma-separated entry of a Misc list, clamped to the last. */
+static FLOAT G_MiscListNum(LPCSTR key, DWORD n, FLOAT fallback) {
+    LPCSTR v = Stb_IniCacheFind(&game.config.misc, "Misc", key);
+    if (!v || !*v) {
+        return fallback;
+    }
+    FLOAT val = fallback;
+    for (DWORD i = 0; ; i++) {
+        val = (FLOAT)atof(v);
+        LPCSTR const comma = strchr(v, ',');
+        if (i >= n || !comma) {
+            break;
+        }
+        v = comma + 1;
+    }
+    return val;
+}
+
+BOOL G_UnitIsHero(LPCEDICT ent) {
+    return ent->data.UnitBalance->strength > 0 || ent->data.UnitBalance->agility > 0 || ent->data.UnitBalance->intelligence > 0;
+}
+
+static BOOL G_HeroReceivesKillXP(LPCEDICT hero, LPCEDICT victim, LPCEDICT killer, FLOAT range) {
+    if (!hero->inuse || !(hero->svflags & SVF_MONSTER) || !hero->data.UnitBalance ||
+        hero->health.value <= 0 || hero->hero.suspend_xp || (hero->aiflags & AI_ILLUSION) ||
+        !G_UnitIsHero(hero) ||
+        (range >= 0.0f && Vector2_distance(&hero->s.origin2, &victim->s.origin2) > range)) {
+        return false;
+    }
+    if (hero->s.player == killer->s.player) {
+        return true;
+    }
+    return hero->s.player < MAX_PLAYERS && killer->s.player < MAX_PLAYERS &&
+           (level.alliances[killer->s.player][hero->s.player] & (1 << ALLIANCE_SHARED_XP));
+}
+
+/* Award experience for killing `victim` to nearby heroes owned by the killer
+ * or covered by the killer player's directional SHARED_XP alliance. Warcraft
+ * divides the available victim XP across all eligible nearby heroes before
+ * applying each receiving Hero's level factor. */
+void G_GrantKillXP(LPEDICT victim, LPEDICT killer) {
+    DWORD const vcls = victim->class_id;
+    if (victim->aiflags & AI_ILLUSION) return;
+    DWORD receivers = 0;
+    if (G_PlayerTreatsPlayerAsAlly(killer->s.player, victim->s.player)) {
+        return; /* forced attacks on passive allies do not award Hero XP */
+    }
+    if (G_UnitIsBuilding(vcls) && G_MiscNum("BuildingKillsGiveExp", 0.0f) == 0.0f) {
+        return;
+    }
+    BOOL const victimHero = G_UnitIsHero(victim);
+    DWORD const victimLevel = victimHero ? (DWORD)MAX(1, (LONG)victim->hero.level)
+                                         : (DWORD)MAX(1, victim->data.UnitBalance->level);
+    DWORD baseXP;
+    if (victimHero) {
+        baseXP = (DWORD)G_MiscListNum("GrantHeroXP", victimLevel - 1, 100.0f);
+    } else {
+        FLOAT const g0 = G_MiscNum("GrantNormalXP", 25.0f);
+        FLOAT const gb = G_MiscNum("GrantNormalXPFormulaB", 5.0f);
+        baseXP = (DWORD)(g0 + gb * (FLOAT)(victimLevel - 1));
+    }
+    FLOAT const range = G_MiscNum("HeroExpRange", 1200.0f);
+
+    FOR_LOOP(i, globals.num_edicts) {
+        if (G_HeroReceivesKillXP(&globals.edicts[i], victim, killer, range)) {
+            receivers++;
+        }
+    }
+
+    /* Warsmash/Warcraft's GlobalExperience policy is a fallback: use global
+     * eligible heroes only when no receiver is inside HeroExpRange. */
+    BOOL const global = !receivers &&
+        G_MiscNum("GlobalExperience",
+            1.0f /* BZ_HARDCODED_DATA_FALLBACK: stock WC3 default. */) != 0.0f;
+    if (global) {
+        FOR_LOOP(i, globals.num_edicts) {
+            if (G_HeroReceivesKillXP(&globals.edicts[i], victim, killer, -1.0f)) {
+                receivers++;
+            }
+        }
+    }
+    if (!receivers) return;
+
+    FOR_LOOP(i, globals.num_edicts) {
+        LPEDICT h = &globals.edicts[i];
+        if (!G_HeroReceivesKillXP(h, victim, killer, global ? -1.0f : range)) {
+            continue;
+        }
+        /* Diminishing returns: hero N levels above the victim earns
+         * HeroFactorXP[N-1] percent (full XP when at or below the victim). */
+        LONG const diff = (LONG)h->hero.level - (LONG)victimLevel;
+        FLOAT factor = 1.0f;
+        if (diff > 0) {
+            factor = G_MiscListNum("HeroFactorXP", (DWORD)(diff - 1), 0.0f) / 100.0f;
+        }
+        DWORD const award = (DWORD)(((FLOAT)baseXP / (FLOAT)receivers) * factor + 0.5f);
+        if (award > 0) {
+            G_HeroSetXP(h, h->hero.xp + award);
+        }
+    }
+}
+
+/* Scripted hero revival (ReviveHero native): bring a dead hero back to life at
+ * (x,y) with HP/mana set from the MiscGame revive factors (defaults: full life,
+ * no mana).  Dead heroes persist (unit_decay_think) so the edict is still valid. */
+void G_ReviveHero(LPEDICT ent, FLOAT x, FLOAT y) {
+    FLOAT mana;
+
+    if (!ent) {
+        return;
+    }
+    if (ent->revival.reviving) G_CancelHeroRevive(ent->revival.producer, ent);
+    FLOAT const lifeFactor = G_MiscNum("HeroReviveLifeFactor", 1.0f);
+    FLOAT const manaFactor = G_MiscNum("HeroReviveManaFactor", 0.0f);
+    FLOAT const manaStart = G_MiscNum("HeroReviveManaStart", 0.0f);
+    ent->svflags &= ~SVF_DEADMONSTER;
+    ent->s.flags &= ~EF_NOT_SELECTABLE;
+    ent->aiflags &= ~AI_HOLD_FRAME;
+    ent->combatentity = NULL;
+    ent->revival.awaiting = false;
+    ent->revival.reviving = false;
+    ent->revival.producer = NULL;
+    ent->revival.queue_next = NULL;
+    ent->revival.player = 0;
+    ent->revival.gold = ent->revival.lumber = 0;
+    ent->revival.progress = 0.0f;
+    ent->s.renderfx &= ~RF_HIDDEN;
+    G_SetHealth(ent, MIN(ent->health.max_value, MAX(1.0f, ent->health.max_value * lifeFactor)));
+    mana = ent->mana.max_value * manaFactor;
+    if (ent->data.UnitBalance) mana += ent->data.UnitBalance->initialMana * manaStart;
+    ent->mana.value = MAX(0.0f, MIN(ent->mana.max_value, mana));
+    ent->s.origin2.x = x;
+    ent->s.origin2.y = y;
+    if (ent->s.flags & EF_FOW_BLOCKER) G_FowMarkBlockersDirty();
+    G_ActivateUnitFood(ent);
+    unit_stand(ent); /* back to a living idle state */
+    gi.LinkEntity(ent);
+}
+
+void SP_monster_unit(LPEDICT self) {
+    self->movetype = unit_movedistance(self) > 0 ? MOVETYPE_STEP : MOVETYPE_NONE;
+    self->die = unit_die;
+    self->stand = unit_stand;
+    self->birth = unit_birth;
+    
+    unit_setmove(self, &unit_move_stand);
+    S_GoldMineInitUnit(self);
+    monster_start(self);
+}

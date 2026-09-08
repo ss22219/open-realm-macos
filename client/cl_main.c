@@ -1,0 +1,1105 @@
+/*
+ * cl_main.c — Main client loop and initialization.
+ *
+ * The client is responsible for three things:
+ *   1. Capturing user input and forwarding commands to the server.
+ *   2. Receiving game state snapshots from the server and applying them.
+ *   3. Preparing and rendering the scene each frame.
+ *
+ * CL_Frame() is the entry point called from the platform event loop.
+ * CL_Init() sets up the renderer and input bindings at startup.
+ */
+#include "client.h"
+#include "cl_control_groups.h"
+#include "cl_input_local.h"
+#include "../common/video_modes.h"
+#include "tr_public.h"
+#include "ui_layout.h"
+#include "sound/s_local.h"
+#include "common/net_platform.h"
+#include "common/server_api.h"
+#ifdef BZ_TESTS
+#include "shared/test.h"
+#endif
+
+refExport_t re;
+menuExport_t menu;
+
+struct client_static cls;
+struct client_state cl;
+
+#define CL_TIMEOUT_MSEC 10000
+
+static DWORD cl_last_packet_time = 0;
+static DWORD cl_realtime = 0;
+static char cl_pending_commands[8][256];
+static DWORD cl_pending_command_count;
+
+typedef enum {
+    CL_MENU_ACTION_NONE,
+    CL_MENU_ACTION_MAP,
+    CL_MENU_ACTION_MENU,
+    CL_MENU_ACTION_LOAD,
+    CL_MENU_ACTION_QUIT,
+} clMenuActionType_t;
+
+typedef struct {
+    clMenuActionType_t type;
+    PATHSTR arg;
+} clPendingMenuAction_t;
+
+static clPendingMenuAction_t cl_pending_menu_action;
+static clPendingMenuAction_t cl_movie_deferred_action;
+static PATHSTR cl_pending_movie;
+
+static BOOL CL_IsDeferredCommand(LPCSTR text) {
+    return text && (!strncmp(text, "give ", 5) || !strcmp(text, "give") ||
+                    !strncmp(text, "god", 3) || !strncmp(text, "kill", 4) ||
+                    !strncmp(text, "research ", 9) ||
+                    !strncmp(text, "warp ", 5) || !strcmp(text, "warp"));
+}
+
+static void CL_FlushPendingCommands(void) {
+    FOR_LOOP(i, cl_pending_command_count) {
+        MSG_WriteByte(&cls.netchan.message, clc_stringcmd);
+        SZ_Printf(&cls.netchan.message, "%s", cl_pending_commands[i]);
+    }
+    cl_pending_command_count = 0;
+}
+
+void Cmd_ForwardToServer(LPCSTR text) {
+    if (cls.state <= ca_connected || *text == '-' || *text == '+') {
+        if (cls.state <= ca_connected && CL_IsDeferredCommand(text) &&
+            cl_pending_command_count < 8) {
+            snprintf(cl_pending_commands[cl_pending_command_count++],
+                     sizeof(cl_pending_commands[0]), "%s", text);
+            return;
+        }
+        fprintf(stderr, "Unknown command \"%s\"\n", text);
+        CON_printf("Unknown command \"%s\"", text);
+        return;
+    }
+    MSG_WriteByte(&cls.netchan.message, clc_stringcmd);
+    SZ_Printf(&cls.netchan.message, "%s", text);
+}
+
+LPCSTR CL_GetConfigString(DWORD index) {
+    return cl.configstrings[index];
+}
+
+void CL_ClientCommand(LPCSTR cmd) {
+    memset(cls.netchan.message.data, 0, cls.netchan.message.maxsize);
+    MSG_WriteByte(&cls.netchan.message, clc_stringcmd);
+    SZ_Printf(&cls.netchan.message, "%s", cmd);
+}
+
+void CL_ClearState(void) {
+    CL_MusicReset();
+    CL_ClearTEnts ();
+    CL_WindowClear();
+    CL_ClearMinimap();
+
+    SAFE_DELETE(cl.fow.visible, MemFree);
+    SAFE_DELETE(cl.fow.explored, MemFree);
+    SAFE_DELETE(cl.fow.texture, MemFree);
+    SAFE_DELETE(cl.minimap_model, re.ReleaseModel);
+    SAFE_DELETE(cl.moveConfirmation, re.ReleaseModel);
+    FOR_LOOP(model, MAX_MODELS) {
+        SAFE_DELETE(cl.models[model], re.ReleaseModel);
+        SAFE_DELETE(cl.portraits[model], re.ReleaseModel);
+    }
+    FOR_LOOP(image, MAX_IMAGES) {
+        if (cl.pics[image]) {
+            re.ReleaseTexture((LPTEXTURE)cl.pics[image]);
+            cl.pics[image] = NULL;
+        }
+    }
+    FOR_LOOP(image, MAX_DYNAMIC_IMAGES) {
+        SAFE_DELETE(cl.dynamicPics[image], re.ReleaseTexture);
+    }
+    SCR_ClearLayoutResources();
+
+    FOR_LOOP(layer, MAX_LAYOUT_LAYERS) {
+        SCR_ClearLayoutLayer(layer);
+    }
+
+    /* Release per-map model ownership before advancing the renderer's
+     * registration sequence, and clear any map-archive asset scope so
+     * menus cannot inherit the previous level's imported overrides. */
+    re.RegisterMap(NULL);
+
+    memset(&cl, 0, sizeof(struct client_state));
+    CL_ControlGroupsReset();
+
+    SZ_Clear (&cls.netchan.message);
+}
+
+/* Forward declarations for UI callbacks */
+static void CL_UIServerCommand(LPCSTR text);
+static void CL_LANRefreshServers(void);
+static DWORD CL_LANNumServers(void);
+static BOOL CL_LANServer(DWORD index, menuLanGame_t *out);
+static void CL_LANConnectServer(DWORD index);
+static LPRENDERER CL_UIGetRenderer(void);
+
+static void CL_MenuCommand(LPCSTR command) {
+    if (!command || !*command) {
+        return;
+    }
+    Cbuf_AddText(command);
+    Cbuf_AddText("\n");
+}
+
+static void CL_DisconnectInternal(LPCSTR reason, BOOL notify, BOOL queue_menu) {
+    if (cls.state == ca_disconnected) {
+        return;
+    }
+
+    fprintf(stderr, "CL_Disconnect: %s\n", reason && *reason ? reason : "disconnected");
+
+    if (cls.state >= ca_connected) {
+        SZ_Clear(&cls.netchan.message);
+        MSG_WriteByte(&cls.netchan.message, clc_stringcmd);
+        MSG_WriteString(&cls.netchan.message, "disconnect");
+        Netchan_Transmit(NS_CLIENT, &cls.netchan);
+    }
+
+    CL_ClearState();
+    cls.state = ca_disconnected;
+    cl_last_packet_time = 0;
+    CL_SetMenuBindings();
+
+    if (!queue_menu) {
+        return;
+    }
+    if (notify) {
+        CL_MenuCommand("menu_disconnected");
+    } else {
+        CL_MenuCommand("menu_main");
+    }
+}
+
+void CL_Disconnect(LPCSTR reason, BOOL notify) {
+    CL_DisconnectInternal(reason, notify, true);
+}
+
+/* UI library FS_ReadFile wrapper — tries engine filesystem first,
+ * then falls back to a raw CWD fopen so share/ files written by
+ * CL_UI_WriteFile (which writes relative to CWD) are readable. */
+static int CL_UI_ReadFile(LPCSTR fileName, void **buf) {
+    int size = FS_ReadFileQ3(fileName, buf);
+    if (size > 0 || !buf) return size;
+    FILE *f = fopen(fileName, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len <= 0) { fclose(f); return -1; }
+    *buf = MemAlloc((size_t)len + 1);
+    if (!*buf) { fclose(f); return -1; }
+    fread(*buf, 1, (size_t)len, f);
+    ((char *)*buf)[len] = '\0';
+    fclose(f);
+    return (int)len;
+}
+
+/* Write a local file by path (relative to CWD, same as share/ configs). */
+static void CL_UI_WriteFile(LPCSTR path, const void *data, int size) {
+    FILE *f;
+    if (!path || !data || size <= 0) return;
+    f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(data, 1, (size_t)size, f);
+    fclose(f);
+}
+
+static BOOL CL_UI_HasExtension(LPCSTR name, LPCSTR extension) {
+    LPCSTR dot;
+
+    if (!extension || !*extension) {
+        return true;
+    }
+    dot = strrchr(name, '.');
+    return dot && !strcasecmp(dot, extension);
+}
+
+static int CL_UI_CompareFileNames(const void *a, const void *b) {
+    return strcasecmp((LPCSTR)a, (LPCSTR)b);
+}
+
+static BOOL CL_UI_ListHasFile(PATHSTR *files, int count, LPCSTR name) {
+    for (int i = 0; i < count; i++) {
+        if (!strcasecmp(files[i], name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+typedef struct {
+    LPCSTR extension;
+    char *listbuf;
+    int bufsize;
+    int used;
+    int count;
+} clUiFileList_t;
+
+static void CL_UI_AddMapFile(LPCSTR path, void *userData) {
+    clUiFileList_t *list = userData;
+    int len;
+
+    if (!list || !CL_UI_HasExtension(path, list->extension)) {
+        return;
+    }
+    len = (int)strlen(path) + 1;
+    if (list->used + len < list->bufsize) {
+        memcpy(list->listbuf + list->used, path, len);
+        list->used += len;
+    }
+    list->count++;
+}
+
+static int CL_UI_GetFileList(LPCSTR path, LPCSTR extension, char *listbuf, int bufsize) {
+    enum { MAX_UI_FILELIST = 1024 };
+    PATHSTR files[MAX_UI_FILELIST];
+    char mask[MAX_PATHLEN * 2];
+    SFILE_FIND_DATA find;
+    HANDLE handle;
+    int count = 0;
+    int used = 0;
+
+    if (!path || !*path || !listbuf || bufsize <= 0) {
+        return 0;
+    }
+    listbuf[0] = '\0';
+    if (!strcasecmp(path, "Maps")) {
+        clUiFileList_t list = { extension, listbuf, bufsize, 0, 0 };
+
+        FS_ListMaps(CL_UI_AddMapFile, &list);
+        if (list.used < list.bufsize) {
+            list.listbuf[list.used] = '\0';
+        }
+        return list.count;
+    }
+    snprintf(mask, sizeof(mask), "%s\\*", path);
+
+    handle = FS_FindFirstFile(mask, &find);
+    while (handle && count < MAX_UI_FILELIST) {
+        if (CL_UI_HasExtension(find.cFileName, extension) &&
+            !CL_UI_ListHasFile(files, count, find.cFileName)) {
+            snprintf(files[count], sizeof(files[count]), "%s", find.cFileName);
+            for (char *p = files[count]; *p; p++) {
+                if (*p == '/') {
+                    *p = '\\';
+                }
+            }
+            count++;
+        }
+        if (!FS_FindNextFile(handle, &find)) {
+            break;
+        }
+    }
+    if (handle) {
+        FS_FindClose(handle);
+    }
+
+    qsort(files, count, sizeof(files[0]), CL_UI_CompareFileNames);
+    for (int i = 0; i < count; i++) {
+        int len = (int)strlen(files[i]) + 1;
+        if (used + len >= bufsize) {
+            break;
+        }
+        memcpy(listbuf + used, files[i], len);
+        used += len;
+    }
+    if (used < bufsize) {
+        listbuf[used] = '\0';
+    }
+    return count;
+}
+
+static BOOL CL_UI_ChooseMapFile(LPSTR out, DWORD out_size) {
+#if defined(__APPLE__)
+    static LPCSTR const command =
+        "/usr/bin/osascript -e 'set selectedFile to choose file with prompt \"选择 Warcraft III 地图\"' "
+        "-e 'POSIX path of selectedFile'";
+    FILE *pipe;
+    int status;
+    size_t length;
+
+    if (!out || out_size == 0) return false;
+    out[0] = '\0';
+    pipe = popen(command, "r");
+    if (!pipe) return false;
+    if (!fgets(out, (int)out_size, pipe)) {
+        pclose(pipe);
+        out[0] = '\0';
+        return false;
+    }
+    status = pclose(pipe);
+    if (status != 0) {
+        out[0] = '\0';
+        return false;
+    }
+    length = strlen(out);
+    while (length > 0 && (out[length - 1] == '\n' || out[length - 1] == '\r')) {
+        out[--length] = '\0';
+    }
+    if ((!CL_UI_HasExtension(out, ".w3m") && !CL_UI_HasExtension(out, ".w3x")) ||
+        !FS_FileExists(out)) {
+        out[0] = '\0';
+        return false;
+    }
+    return true;
+#else
+    (void)out;
+    (void)out_size;
+    return false;
+#endif
+}
+
+static void CL_UIServerCommand(LPCSTR text) {
+    if (!text || !*text || *text == '-' || *text == '+') {
+        return;
+    }
+    MSG_WriteByte(&cls.netchan.message, clc_stringcmd);
+    SZ_Printf(&cls.netchan.message, "%s", text);
+}
+
+/* Renderer access callback for UI rendering */
+static LPRENDERER CL_UIGetRenderer(void) {
+    return &re;
+}
+
+#define CL_MAX_LAN_SERVERS 64
+
+static menuLanGame_t cl_lan_servers[CL_MAX_LAN_SERVERS];
+static DWORD cl_num_lan_servers;
+
+static void CL_InfoValue(LPCSTR info, LPCSTR key, LPSTR out, DWORD out_size) {
+    char needle[64];
+    LPCSTR cursor;
+    LPCSTR value;
+    LPCSTR end;
+    size_t len;
+
+    if (!out || out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!info || !key || !*key) {
+        return;
+    }
+
+    snprintf(needle, sizeof(needle), "\\%s\\", key);
+    cursor = strstr(info, needle);
+    if (!cursor) {
+        return;
+    }
+    value = cursor + strlen(needle);
+    end = strchr(value, '\\');
+    len = end ? (size_t)(end - value) : strlen(value);
+    if (len >= out_size) {
+        len = out_size - 1;
+    }
+    memcpy(out, value, len);
+    out[len] = '\0';
+}
+
+static void CL_LANRefreshServers(void) {
+    netadr_t adr;
+    unsigned short port = (unsigned short)Cvar_Integer("game_port", PORT_SERVER);
+    BOOL const open_client_socket = !NET_IsConfigured(NS_CLIENT);
+
+    memset(cl_lan_servers, 0, sizeof(cl_lan_servers));
+    cl_num_lan_servers = 0;
+    if (open_client_socket) {
+        fprintf(stderr, "CL_LANRefreshServers: opening client UDP socket for LAN queries\n");
+    }
+    NET_ConfigSource(NS_CLIENT, true);
+    if (!NET_IsConfigured(NS_CLIENT)) {
+        fprintf(stderr, "CL_LANRefreshServers: client UDP socket is closed, cannot query LAN servers\n");
+        return;
+    }
+
+    memset(&adr, 0, sizeof(adr));
+    adr.type = NA_BROADCAST;
+    adr.port = htons(port);
+    Netchan_OutOfBandPrint(NS_CLIENT, adr, "info");
+}
+
+static DWORD CL_LANNumServers(void) {
+    return cl_num_lan_servers;
+}
+
+static BOOL CL_LANServer(DWORD index, menuLanGame_t *out) {
+    if (!out || index >= cl_num_lan_servers) {
+        return false;
+    }
+    *out = cl_lan_servers[index];
+    return true;
+}
+
+static void CL_LANConnectServer(DWORD index) {
+    menuLanGame_t *game;
+    unsigned short port = (unsigned short)Cvar_Integer("game_port", PORT_SERVER);
+
+    if (index >= cl_num_lan_servers) {
+        return;
+    }
+    game = &cl_lan_servers[index];
+    Cvar_Set("connect", game->address);
+    CL_Connect(game->address, port);
+}
+
+static void CL_AddLANServer(const netadr_t *from, LPCSTR info) {
+    menuLanGame_t *game;
+    char value[128];
+    LPCSTR address;
+
+    if (!from || !info) {
+        return;
+    }
+    address = NET_AdrToString(from);
+    FOR_LOOP(i, cl_num_lan_servers) {
+        if (!strcmp(cl_lan_servers[i].address, address)) {
+            game = &cl_lan_servers[i];
+            goto update;
+        }
+    }
+    if (cl_num_lan_servers >= CL_MAX_LAN_SERVERS) {
+        fprintf(stderr, "CL_AddLANServer: ignoring %s, LAN server list is full\n", address);
+        return;
+    }
+    game = &cl_lan_servers[cl_num_lan_servers++];
+    memset(game, 0, sizeof(*game));
+    snprintf(game->address, sizeof(game->address), "%s", address);
+
+update:
+    CL_InfoValue(info, "hostname", game->hostname, sizeof(game->hostname));
+    CL_InfoValue(info, "mapname", game->mapname, sizeof(game->mapname));
+    CL_InfoValue(info, "players", value, sizeof(value));
+    game->players = (DWORD)atoi(value);
+    CL_InfoValue(info, "maxplayers", value, sizeof(value));
+    game->maxPlayers = (DWORD)atoi(value);
+    CL_InfoValue(info, "speed", value, sizeof(value));
+    game->speed = (DWORD)atoi(value);
+    CL_InfoValue(info, "slots", value, sizeof(value));
+    game->slots = (DWORD)atoi(value);
+    if (!game->hostname[0]) {
+        snprintf(game->hostname, sizeof(game->hostname), "%s", "OpenWarcraft3");
+    }
+}
+
+static void CL_UICvarSet(LPCSTR name, LPCSTR value) {
+    Cvar_Set(name, value);
+}
+
+void CL_SetLoadingProgress(FLOAT progress) {
+    if (progress < 0.0f) progress = 0.0f;
+    if (progress > 1.0f) progress = 1.0f;
+    if (progress <= cl.loading_progress) return;
+    cl.loading_progress = progress;
+    SCR_UpdateLoadingPlaque();
+}
+
+void CL_BeginLoadingMap(LPCSTR mapName) {
+    /* Per-map input conveniences must never retain entity numbers into the
+     * next world, where those numbers may refer to unrelated entities. */
+    CL_InputModeResetMap();
+    CL_ControlGroupsReset();
+    /* Publish the resolved map before freezing the plaque; menu launches have no startup map cvar. */
+    Cvar_Set("map", mapName);
+    /* Same-map load keeps CS_WORLD unchanged; forget the previous world's begin
+     * so PrepRefresh sends it again and CL_ParseFrame can end the plaque. */
+    CL_RestartRefresh();
+    cl.loading_progress = 0.0f;
+    cl.playerstate.client_ui_state = CLIENT_UI_LOADING;
+    cls.state = ca_connected;
+    CL_MenuCommand("menu_ingame");
+    SCR_BeginLoadingPlaque();
+    /* New map baselines repopulate the compact active-entity list; drop any
+     * stale entries from the previous map before they arrive. */
+    cl.num_active = 0;
+}
+
+/* Public wrapper for UI library and input system (Phase 8.6) */
+void CL_RequestUnitUI(DWORD num_selected, DWORD *entity_nums) {
+    (void)num_selected;
+    (void)entity_nums;
+    menu.UpdateUnitUI(0, NULL);
+}
+
+int CL_ModelIndex(LPCSTR modelName) {
+    /* Find or register model */
+    for (DWORD i = 1; i < MAX_MODELS; i++) {
+        if (cl.models[i] == NULL) {
+            cl.models[i] = re.LoadModel(modelName);
+            return (int)i;
+        }
+        /* Check if already loaded - compare configstring */
+        if (*cl.configstrings[CS_MODELS + i] && !strcmp(cl.configstrings[CS_MODELS + i], modelName)) {
+            return (int)i;
+        }
+    }
+    return 0;
+}
+
+int CL_ImageIndex(LPCSTR imageName) {
+    /* Find or register image */
+    for (DWORD i = 1; i < MAX_IMAGES; i++) {
+        if (cl.pics[i] == NULL) {
+            cl.pics[i] = re.LoadTexture(imageName);
+            return (int)i;
+        }
+        /* Check if already loaded */
+        if (*cl.configstrings[CS_IMAGES + i] && !strcmp(cl.configstrings[CS_IMAGES + i], imageName)) {
+            return (int)i;
+        }
+    }
+    return 0;
+}
+
+LPCSTR CL_ResolveImagePath(LPCSTR imageName) {
+    return menu.ResolveImagePath ? menu.ResolveImagePath(imageName) : imageName;
+}
+
+int CL_FontIndex(LPCSTR fontName, DWORD fontSize) {
+    /* Create font spec string */
+    char fontspec[256];
+    snprintf(fontspec, sizeof(fontspec), "%s,%u", fontName, fontSize);
+    
+    /* Find or register font */
+    for (DWORD i = 1; i < MAX_FONTSTYLES; i++) {
+        if (cl.fonts[i] == NULL) {
+            cl.fonts[i] = re.LoadFont(fontName, fontSize);
+            return (int)i;
+        }
+        /* Check if already loaded */
+        if (*cl.configstrings[CS_FONTS + i] && !strcmp(cl.configstrings[CS_FONTS + i], fontspec)) {
+            return (int)i;
+        }
+    }
+    return 0;
+}
+
+void CL_UIMenuCommand(LPCSTR command) {
+    CON_printf("CL_UIMenuCommand: %s\\n", command);
+    CL_MenuCommand(command);
+}
+
+static VIDEOMODE CL_VideoMode(void) { return *video_mode_get(Cvar_Integer("vid_mode", BZ_VIDEO_MODE_DEFAULT)); }
+
+static void CL_VideoApply_f(void) {
+    VIDEOMODE mode = CL_VideoMode();
+
+    if (re.SetWindowSize) {
+        re.SetWindowSize(mode.width, mode.height);
+    }
+}
+
+static void CL_RebuildMenu(LPCSTR target) {
+    Cvar_Set("map", "");
+    menu.Shutdown();
+    re.RegisterMap(NULL);
+    menu.Init();
+    if (target && *target && strcmp(target, "menu_main")) {
+        CL_MenuCommand(target);
+    }
+}
+
+static void CL_MenuRestart_f(void) {
+    if (cls.state != ca_disconnected) {
+        return;
+    }
+    CL_RebuildMenu("menu_main");
+}
+
+static void CL_Quit_f(void) {
+    CL_Shutdown();
+    Com_Quit();
+}
+
+/* Game modules request session-boundary actions through gi.MenuAction while
+ * their simulation/JASS call stack may still be active.  Never tear down or
+ * replace the current world inline from that callback.  Copy the request and
+ * execute it from the following client frame, after SV_Frame has returned. */
+void MenuAction(LPCSTR action, LPCSTR arg) {
+    clPendingMenuAction_t pending = { 0 };
+
+    if (!action || !*action) return;
+    if (!strcmp(action, "map")) {
+        if (!arg || !*arg) return;
+        if (!Com_ResolveMapArgument(arg, pending.arg, sizeof(pending.arg))) return;
+        pending.type = CL_MENU_ACTION_MAP;
+    } else if (!strcmp(action, "menu")) {
+        pending.type = CL_MENU_ACTION_MENU;
+        if (arg && *arg) strlcpy(pending.arg, arg, sizeof(pending.arg));
+    } else if (!strcmp(action, "load")) {
+        if (!arg || !*arg) return;
+        pending.type = CL_MENU_ACTION_LOAD;
+        strlcpy(pending.arg, arg, sizeof(pending.arg));
+    } else if (!strcmp(action, "quit")) {
+        pending.type = CL_MENU_ACTION_QUIT;
+    } else {
+        return;
+    }
+
+    if (cl_pending_menu_action.type != CL_MENU_ACTION_NONE) {
+        fprintf(stderr, "MenuAction: replacing pending session action %u with %u\n",
+                (unsigned)cl_pending_menu_action.type, (unsigned)pending.type);
+    }
+    cl_pending_menu_action = pending;
+}
+
+void CL_QueueMovie(LPCSTR path) {
+    if (!path || !*path) return;
+    if (cl_pending_movie[0]) {
+        fprintf(stderr, "CL_QueueMovie: replacing pending movie %s with %s\n", cl_pending_movie, path);
+    }
+    snprintf(cl_pending_movie, sizeof(cl_pending_movie), "%s", path);
+}
+
+static void CL_ProcessPendingMenuAction(void) {
+    clPendingMenuAction_t pending;
+
+    if (CL_MovieActive()) return;
+
+    if (cl_movie_deferred_action.type != CL_MENU_ACTION_NONE) {
+        pending = cl_movie_deferred_action;
+        memset(&cl_movie_deferred_action, 0, sizeof(cl_movie_deferred_action));
+        if (SV_IsActive()) SV_SetPaused(false);
+        goto execute;
+    }
+    if (cl_pending_menu_action.type == CL_MENU_ACTION_NONE) return;
+
+    /* Clear first: the transition may initialize a new game module which can
+     * itself publish a later session action without being overwritten here. */
+    pending = cl_pending_menu_action;
+    memset(&cl_pending_menu_action, 0, sizeof(cl_pending_menu_action));
+
+    /* PlayCinematic is a session-boundary interposer: preserve the requested
+     * map/menu transition, freeze the outgoing simulation, then execute the
+     * transition only after the movie ends or is skipped. */
+    if (cl_pending_movie[0]) {
+        PATHSTR movie;
+        snprintf(movie, sizeof(movie), "%s", cl_pending_movie);
+        cl_pending_movie[0] = '\0';
+        cl_movie_deferred_action = pending;
+        if (SV_IsActive()) SV_SetPaused(true);
+        if (CL_PlayMovie(movie)) return;
+        if (SV_IsActive()) SV_SetPaused(false);
+        pending = cl_movie_deferred_action;
+        memset(&cl_movie_deferred_action, 0, sizeof(cl_movie_deferred_action));
+    }
+
+execute:
+    switch (pending.type) {
+    case CL_MENU_ACTION_MAP:
+        CL_SetGameplayBindings();
+        CL_BeginLoadingMap(pending.arg);
+        SV_Map(pending.arg);
+        if (SV_IsActive()) CL_SetLoadingProgress(0.05f);
+        break;
+    case CL_MENU_ACTION_MENU:
+        /* Returning from a world is a session boundary, not an in-place menu
+         * navigation.  Shut the client/server world down first, then rebuild
+         * the menu after clearing the map asset scope so FDF/model state is
+         * valid again even after a runtime menu restart. */
+        CL_DisconnectInternal("Game ended.", false, false);
+        SV_Shutdown();
+        CL_RebuildMenu(pending.arg[0] ? pending.arg : "menu_main");
+        break;
+    case CL_MENU_ACTION_LOAD: {
+        PATHSTR map;
+        if (!SV_GetSaveMap(pending.arg, map, sizeof(map))) break;
+        CL_SetGameplayBindings();
+        CL_BeginLoadingMap(map);
+        SV_LoadGame(pending.arg, map);
+        break;
+    }
+    case CL_MENU_ACTION_QUIT:
+        CL_Quit_f();
+        break;
+    case CL_MENU_ACTION_NONE:
+        break;
+    }
+}
+
+#ifdef BZ_TESTS
+TEST(client_loading, progress_is_clamped_and_monotonic) {
+    FLOAT saved = cl.loading_progress;
+    DWORD saved_disable_screen = cls.disable_screen;
+
+    cls.disable_screen = 0;
+    cl.loading_progress = 0.0f;
+    CL_SetLoadingProgress(0.25f);
+    T_FEQ(cl.loading_progress, 0.25f, 0.0001f);
+    CL_SetLoadingProgress(0.10f);
+    T_FEQ(cl.loading_progress, 0.25f, 0.0001f);
+    CL_SetLoadingProgress(2.0f);
+    T_FEQ(cl.loading_progress, 1.0f, 0.0001f);
+
+    cl.loading_progress = saved;
+    cls.disable_screen = saved_disable_screen;
+}
+
+TEST(client_session, menu_action_map_is_deferred_until_client_frame) {
+    memset(&cl_pending_menu_action, 0, sizeof(cl_pending_menu_action));
+
+    MenuAction("map", "Maps\\Campaign\\Human02.w3m");
+
+    T_EQ(cl_pending_menu_action.type, CL_MENU_ACTION_MAP);
+    T_STREQ(cl_pending_menu_action.arg, "Maps\\Campaign\\Human02.w3m");
+
+    /* Do not call CL_ProcessPendingMenuAction here: the regression contract is
+     * specifically that MenuAction itself cannot enter SV_Map re-entrantly. */
+    memset(&cl_pending_menu_action, 0, sizeof(cl_pending_menu_action));
+}
+
+TEST(client_session, menu_action_named_load_is_deferred_until_client_frame) {
+    memset(&cl_pending_menu_action, 0, sizeof(cl_pending_menu_action));
+
+    MenuAction("load", "chapter-01");
+
+    T_EQ(cl_pending_menu_action.type, CL_MENU_ACTION_LOAD);
+    T_STREQ(cl_pending_menu_action.arg, "chapter-01");
+
+    /* Loading rebuilds the server/map, so MenuAction must only capture the
+     * selected save while the gameplay-window callback is still active. */
+    memset(&cl_pending_menu_action, 0, sizeof(cl_pending_menu_action));
+}
+
+TEST(client_session, menu_action_menu_is_deferred_until_client_frame) {
+    memset(&cl_pending_menu_action, 0, sizeof(cl_pending_menu_action));
+
+    MenuAction("menu", "menu_main");
+
+    T_EQ(cl_pending_menu_action.type, CL_MENU_ACTION_MENU);
+    T_STREQ(cl_pending_menu_action.arg, "menu_main");
+
+    /* Client-owned leave buttons use this path so they cannot rebuild FDF/menu
+     * state while the gameplay window input callback is still on the stack. */
+    memset(&cl_pending_menu_action, 0, sizeof(cl_pending_menu_action));
+}
+
+static DWORD cl_test_menu_shutdown_count;
+static DWORD cl_test_menu_init_count;
+static DWORD cl_test_register_map_count;
+static BOOL cl_test_register_map_was_null;
+
+static void CL_TestMenuShutdown(void) {
+    cl_test_menu_shutdown_count++;
+}
+
+static void CL_TestMenuInit(void) {
+    cl_test_menu_init_count++;
+}
+
+static void CL_TestRegisterMap(LPCSTR map) {
+    cl_test_register_map_count++;
+    cl_test_register_map_was_null = map == NULL;
+}
+
+TEST(client_session, menu_rebuild_clears_world_scope_before_returning_to_menu) {
+    void (*old_shutdown)(void) = menu.Shutdown;
+    void (*old_init)(void) = menu.Init;
+    void (*old_register_map)(LPCSTR) = re.RegisterMap;
+
+    cl_test_menu_shutdown_count = 0;
+    cl_test_menu_init_count = 0;
+    cl_test_register_map_count = 0;
+    cl_test_register_map_was_null = false;
+    menu.Shutdown = CL_TestMenuShutdown;
+    menu.Init = CL_TestMenuInit;
+    re.RegisterMap = CL_TestRegisterMap;
+    Cvar_Set("map", "maps/test.map");
+
+    CL_RebuildMenu("menu_main");
+
+    T_STREQ(Cvar_String("map", NULL), "");
+    T_EQ(cl_test_menu_shutdown_count, 1);
+    T_EQ(cl_test_register_map_count, 1);
+    T_ASSERT(cl_test_register_map_was_null);
+    T_EQ(cl_test_menu_init_count, 1);
+
+    menu.Shutdown = old_shutdown;
+    menu.Init = old_init;
+    re.RegisterMap = old_register_map;
+}
+
+#endif
+
+void CL_Init(void) {
+    VIDEOMODE mode;
+
+    CON_printf("OpenWarcraft3 v0.1");
+    fprintf(stderr, "Console initialized.\n");
+
+    re = R_GetAPI((refImport_t) {
+        .MemAlloc = MemAlloc,
+        .MemFree = MemFree,
+        .FS_ReadFile = FS_ReadFileQ3,
+        .FS_FreeFile = FS_FreeFile,
+        .FS_MmapFile = FS_MmapFile,
+        .FS_MunmapFile = FS_MunmapFile,
+        .FileExtract = FS_ExtractFile,
+        .LoadSlk = Stb_SlkLoad,
+        .CvarString = Cvar_String,
+        .error = CON_printf,
+    });
+
+    Cmd_AddCommand("vid_apply", CL_VideoApply_f);
+    
+    mode = CL_VideoMode();
+    re.Init(mode.width, mode.height);
+    
+    S_Init();
+    CL_MusicInit();
+    CL_MovieInit();
+
+    /* Initialize UI library */
+    menu = M_GetAPI((menuImport_t) {
+        .FS_ReadFile = CL_UI_ReadFile,
+        .FS_FreeFile = FS_FreeFile,
+        .FS_GetFileList = CL_UI_GetFileList,
+        .ChooseMapFile = CL_UI_ChooseMapFile,
+        .FS_WriteFile = CL_UI_WriteFile,
+        .MemAlloc = MemAlloc,
+        .MemFree = MemFree,
+        .ImageIndex = CL_ImageIndex,
+        .ModelIndex = CL_ModelIndex,
+        .FontIndex = CL_FontIndex,
+        .Cmd_AddCommand = Cmd_AddCommand,
+        .Cmd_ExecuteText = Cbuf_AddText,
+        .ServerCommand = CL_UIServerCommand,
+        .Cvar_String = Cvar_String,
+        .Cvar_Set = CL_UICvarSet,
+        .GetConfigString = CL_GetConfigString,
+        .LAN_RefreshServers = CL_LANRefreshServers,
+        .LAN_NumServers = CL_LANNumServers,
+        .LAN_Server = CL_LANServer,
+        .LAN_ConnectServer = CL_LANConnectServer,
+        .GetRenderer = CL_UIGetRenderer,
+        .Printf = CON_printf,
+        .PlaySound = S_PlaySound,
+        .PlaySoundByName = S_PlaySoundByName,
+        .PlayMovie = CL_PlayMovie,
+    });
+    
+    menu.Init();
+
+    SZ_Init(&cls.netchan.message, cls.netchan.message_buf, MAX_MSGLEN);
+    
+    CL_ClearState();
+
+    Cmd_AddCommand("quit", CL_Quit_f);
+    Cmd_AddCommand("screenshot", CL_Screenshot_f);
+    Cmd_AddCommand("menu_restart", CL_MenuRestart_f);
+
+    CON_Init();
+    CL_InitInput();
+
+    CL_SetMenuBindings();
+    cls.state = ca_disconnected;
+    scr_initialized = true;
+#ifdef WOW
+    CL_MenuCommand("menu_login");
+#else
+    CL_MenuCommand("menu_main");
+#endif
+}
+
+void CL_ConnectionlessPacket(const netadr_t *from, LPSIZEBUF msg) {
+    char payload[1024] = { 0 };
+    char command[256] = { 0 };
+    char *info;
+    DWORD length;
+
+    if (msg->cursize <= 4) {
+        return;
+    }
+    length = msg->cursize - 4;
+    if (length >= sizeof(payload)) {
+        length = sizeof(payload) - 1;
+    }
+    memcpy(payload, msg->data + 4, length);
+    sscanf(payload, "%255s", command);
+    if (!strcmp(command, "info")) {
+        info = strchr(payload, '\n');
+        CL_AddLANServer(from, info ? info + 1 : "");
+        return;
+    }
+    if (strcmp(command, "client_connect")) {
+        return;
+    }
+
+    /* Q2 resets the client at the new connection boundary. The server sends
+     * the complete configstring/baseline stream again, so old media indices
+     * must not be retained or rebound after a same-map save/load. */
+    CL_ClearState();
+    CL_RestartRefresh();
+    MSG_WriteByte(&cls.netchan.message, clc_stringcmd);
+    MSG_WriteString(&cls.netchan.message, "new");
+    if (cls.state < ca_connected) {
+        cls.state = ca_connected;
+    }
+}
+
+static void CL_ReadPacketMessage(const netadr_t *from, LPSIZEBUF msg, int length) {
+    cl_last_packet_time = cl_realtime;
+    if (length >= 4) {
+        int hdr;
+
+        memcpy(&hdr, msg->data, sizeof(hdr));
+        if (hdr == -1) {
+            CL_ConnectionlessPacket(from, msg);
+            return;
+        }
+    }
+    CL_ParseServerMessage(msg);
+}
+
+/* Read all available server packets from the network buffer and dispatch each
+ * message type to the appropriate CL_Parse* handler in cl_parse.c. */
+void CL_ReadPackets(void) {
+    static BYTE net_message_buffer[MAX_MSGLEN];
+    static sizeBuf_t net_message = {
+        .data = net_message_buffer,
+        .maxsize = MAX_MSGLEN,
+        .cursize = 0,
+        .readcount = 0,
+    };
+    netadr_t from;
+    int r;
+
+    while ((r = NET_GetLoopPacket(NS_CLIENT, &from, &net_message)) != 0) {
+        CL_ReadPacketMessage(&from, &net_message, r);
+    }
+    while ((r = NET_GetPacket(NS_CLIENT, &from, &net_message)) != 0) {
+        CL_ReadPacketMessage(&from, &net_message, r);
+    }
+}
+
+void CL_SendCmd(void) {
+    if (cls.state == ca_disconnected || cls.state == ca_connecting) {
+        return;
+    }
+    Netchan_Transmit(NS_CLIENT, &cls.netchan);
+}
+
+static void CL_CheckTimeout(void) {
+    if (cls.state < ca_connected || cl_last_packet_time == 0) {
+        return;
+    }
+    if (cl_realtime - cl_last_packet_time <= CL_TIMEOUT_MSEC) {
+        return;
+    }
+    CL_Disconnect("Connection to host timed out.", true);
+}
+
+/* Set up the netchan to point at a remote server and send an initial
+ * connection request.  The server will respond with an out-of-band
+ * "client_connect" packet which triggers CL_ConnectionlessPacket(). */
+static void CL_SanitizeUserinfoValue(LPCSTR in, LPSTR out, DWORD out_size) {
+    DWORD write = 0;
+
+    if (!out || out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!in) {
+        return;
+    }
+    for (; *in && write + 1 < out_size; in++) {
+        unsigned char c = (unsigned char)*in;
+
+        if (c == '\\' || c == '\n' || c == '\r') {
+            c = ' ';
+        }
+        if (c < 32) {
+            continue;
+        }
+        out[write++] = (char)c;
+    }
+    out[write] = '\0';
+}
+
+void CL_Connect(LPCSTR host, unsigned short port) {
+    netadr_t adr;
+    UINAME name;
+
+    if (!NET_StringToAdr(host, port, &adr)) {
+        fprintf(stderr, "CL_Connect: bad server address \"%s\"\n", host);
+        return;
+    }
+    // Loopback (localhost) needs no UDP socket — packets go through the
+    // in-memory ring buffer.  Only open the socket for remote addresses.
+    if (adr.type != NA_LOOPBACK) {
+        NET_ConfigSource(NS_CLIENT, true);
+        if (!NET_IsConfigured(NS_CLIENT)) {
+            fprintf(stderr, "CL_Connect: client UDP socket is closed, cannot connect\n");
+            return;
+        }
+    }
+    cls.netchan.remote_address = adr;
+    SZ_Init(&cls.netchan.message, cls.netchan.message_buf, MAX_MSGLEN);
+    cls.state = ca_connecting;
+    // Send an out-of-band "connect" request; the server will register this
+    // client slot and reply with "client_connect".
+    CL_SanitizeUserinfoValue(Cvar_String("name", "Player"), name, sizeof(name));
+    Netchan_OutOfBandPrint(NS_CLIENT, adr, "connect\n\\name\\%s", name[0] ? name : "Player");
+    if (adr.type == NA_LOOPBACK)
+        fprintf(stderr, "CL_Connect: connecting to local server via loopback\n");
+    else
+        fprintf(stderr, "CL_Connect: connecting to %d.%d.%d.%d:%u\n",
+                adr.ip[0], adr.ip[1], adr.ip[2], adr.ip[3], ntohs(adr.port));
+}
+
+void CL_Shutdown(void) {
+    menu.Shutdown();
+    FOR_LOOP(modelIndex, MAX_MODELS) {
+        SAFE_DELETE(cl.models[modelIndex], re.ReleaseModel);
+        SAFE_DELETE(cl.portraits[modelIndex], re.ReleaseModel);
+    }
+    SAFE_DELETE(cl.minimap_model, re.ReleaseModel);
+    FOR_LOOP(imageIndex, MAX_DYNAMIC_IMAGES) {
+        SAFE_DELETE(cl.dynamicPics[imageIndex], re.ReleaseTexture);
+    }
+    CL_MovieShutdown();
+    CL_MusicShutdown();
+    V_Shutdown();
+    re.Shutdown();
+    S_Shutdown();
+}
+
+void CL_SendCommand(void) {
+    CL_SendCmd();
+
+    Cbuf_Execute();
+}
+
+/* Main client tick called from the platform event loop.
+ * Advances the client clock, applies incoming server state, samples input,
+ * sends commands, and renders the current frame. */
+void CL_Frame(DWORD msec) {
+    cl_realtime += msec;
+    cl.time += msec;
+
+    CL_ProcessPendingMenuAction();
+    CL_Input();
+    CL_MovieUpdate();
+    CL_ReadPackets();
+    CL_MusicUpdate();
+    CL_CheckTimeout();
+    CL_SendCommand();
+    if (cls.state == ca_connected && !cl.refresh_prepped) {
+        CL_PrepRefresh();
+    } else if (cls.state == ca_active) {
+        CL_PrepRefresh();
+        if (cl_pending_command_count) {
+            CL_FlushPendingCommands();
+        }
+    }
+    SCR_UpdateScreen(msec);
+}

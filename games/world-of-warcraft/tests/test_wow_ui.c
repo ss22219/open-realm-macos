@@ -1,0 +1,468 @@
+#include "test.h"
+
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+#include "client/menu.h"
+#include "common/mpq.h"
+#include "common/wow_ui_shared.h"
+#include "menu/menu_local.h"
+
+#ifndef TEST_WOW_MPQ
+#define TEST_WOW_MPQ "build/tests/test-wow.mpq"
+#endif
+
+struct texture {
+    DWORD texid;
+    DWORD width;
+    DWORD height;
+    char name[256];
+};
+
+struct font {
+    DWORD size;
+    char name[256];
+};
+
+
+static HANDLE test_archive;
+static PLAYER test_ps;
+static refExport_t test_renderer;
+static LPCTEXTURE test_textures[MAX_IMAGES];
+static DWORD next_texture_id;
+static DWORD loaded_textures;
+static DWORD missing_textures;
+static DWORD forbidden_texture_loads;
+static DWORD draw_panel_count;
+static DWORD draw_inventory_count;
+static DWORD draw_fill_count;
+static DWORD draw_text_count;
+static DWORD draw_cursor_count;
+static DWORD draw_minimap_count;
+static DWORD draw_tip_alert_count;
+static char last_draw_text[256];
+static char last_server_command[256];
+static char last_cmd_execute_text[256];
+static DWORD last_panel_width;
+static DWORD last_panel_height;
+static DWORD last_inventory_width;
+static DWORD last_inventory_height;
+static char test_show_tips[8];
+
+static BOOL test_path_is_wow_default(LPCSTR name) {
+    return name &&
+        (strstr(name, "Interface\\TargetingFrame\\UI-PlayerFrame.blp") ||
+         strstr(name, "Interface\\MainMenuBar\\UI-MainMenuBar.blp") ||
+         strstr(name, "Interface\\Glues\\LoadingBar\\"));
+}
+
+static DWORD test_read32(BYTE const *p) {
+    return ((DWORD)p[0]) | ((DWORD)p[1] << 8) | ((DWORD)p[2] << 16) | ((DWORD)p[3] << 24);
+}
+
+static int test_fs_read_file(LPCSTR fileName, void **buf) {
+    HANDLE file;
+    DWORD size;
+    DWORD read = 0;
+
+    if (!buf) {
+        return -1;
+    }
+    *buf = NULL;
+    if (!test_archive || !SFileOpenFileEx(test_archive, fileName, SFILE_OPEN_FROM_MPQ, &file)) {
+        return -1;
+    }
+    size = SFileGetFileSize(file, NULL);
+    *buf = calloc(1, (size_t)size + 1);
+    if (!*buf || !SFileReadFile(file, *buf, size, &read, NULL) || read != size) {
+        free(*buf);
+        *buf = NULL;
+        SFileCloseFile(file);
+        return -1;
+    }
+    SFileCloseFile(file);
+    return (int)size;
+}
+
+static void test_fs_free_file(void *buf) {
+    free(buf);
+}
+
+static HANDLE test_mem_alloc(long size) {
+    return calloc(1, (size_t)size);
+}
+
+static void test_mem_free(HANDLE mem) {
+    free(mem);
+}
+
+static void test_printf(LPCSTR fmt, ...) {
+    (void)fmt;
+}
+
+static void test_read_texture_size(LPCSTR name, LPTEXTURE texture) {
+    void *buf = NULL;
+    int size = test_fs_read_file(name, &buf);
+
+    texture->width = 0;
+    texture->height = 0;
+    if (size >= 20 && buf && test_read32(buf) == ID_BLP2) {
+        texture->width = test_read32((BYTE const *)buf + 12);
+        texture->height = test_read32((BYTE const *)buf + 16);
+    } else {
+        missing_textures++;
+    }
+    test_fs_free_file(buf);
+}
+
+static LPTEXTURE test_load_texture(LPCSTR name) {
+    LPTEXTURE texture = calloc(1, sizeof(*texture));
+
+    T_NOT_NULL(texture);
+    if (!texture) {
+        return NULL;
+    }
+    texture->texid = ++next_texture_id;
+    snprintf(texture->name, sizeof(texture->name), "%s", name ? name : "");
+    test_read_texture_size(name, texture);
+    loaded_textures++;
+    if (test_path_is_wow_default(name)) {
+        forbidden_texture_loads++;
+    }
+    return texture;
+}
+
+static LPFONT test_load_font(LPCSTR name, DWORD size) {
+    LPFONT font = calloc(1, sizeof(*font));
+
+    T_NOT_NULL(font);
+    if (!font) {
+        return NULL;
+    }
+    font->size = size;
+    snprintf(font->name, sizeof(font->name), "%s", name ? name : "");
+    return font;
+}
+
+static void test_release_texture(LPTEXTURE texture) {
+    free(texture);
+}
+
+static size2_t test_get_texture_size(LPCTEXTURE texture) {
+    size2_t s = {0, 0};
+    if (texture) { s.width = texture->width; s.height = texture->height; }
+    return s;
+}
+
+static void test_draw_image(LPCTEXTURE texture, LPCRECT screen, LPCRECT uv, COLOR32 color) {
+    (void)uv;
+    (void)color;
+    if (!texture) {
+        return;
+    }
+    if (!strcmp(texture->name, "Interface\\Test\\LuaPanel.blp")) {
+        draw_panel_count++;
+        last_panel_width = texture->width;
+        last_panel_height = texture->height;
+    } else if (!strcmp(texture->name, "Interface\\Test\\Inventory.blp")) {
+        draw_inventory_count++;
+        last_inventory_width = texture->width;
+        last_inventory_height = texture->height;
+    } else if (!strcmp(texture->name, "Interface\\TutorialFrame\\TutorialFrameAlert") ||
+               !strcmp(texture->name, "Interface\\TutorialFrame\\TutorialFrameAlert.blp")) {
+        draw_tip_alert_count++;
+    }
+}
+
+static void test_draw_image_ex(LPCDRAWIMAGE image) {
+    if (image) {
+        test_draw_image(image->texture, &image->screen, &image->uv, image->color);
+    }
+}
+
+static void test_draw_fill(LPCRECT rect, COLOR32 color) {
+    (void)rect;
+    (void)color;
+    draw_fill_count++;
+}
+
+static void test_draw_minimap(LPCRECT rect) {
+    (void)rect;
+    draw_minimap_count++;
+}
+
+static VECTOR2 test_get_text_size(LPCDRAWTEXT drawText) {
+    FLOAT w = drawText && drawText->text ? (FLOAT)strlen(drawText->text) * 0.01f : 0.0f;
+    FLOAT h = drawText && drawText->font ? drawText->font->size / 1000.0f : 0.012f;
+    return MAKE(VECTOR2, w, h);
+}
+
+static void test_draw_text(LPCDRAWTEXT drawText) {
+    draw_text_count++;
+    snprintf(last_draw_text, sizeof(last_draw_text), "%s", drawText && drawText->text ? drawText->text : "");
+    if (drawText && drawText->text && !strcmp(drawText->text, "|"))
+        draw_cursor_count++;
+}
+
+static LPCTEXTURE test_get_texture(DWORD index) {
+    return index < MAX_IMAGES ? test_textures[index] : NULL;
+}
+
+static int test_image_index(LPCSTR imageName) {
+    FOR_LOOP(i, MAX_IMAGES) {
+        LPCTEXTURE texture = test_textures[i];
+
+        if (texture && !strcmp(texture->name, imageName)) {
+            return (int)i;
+        }
+    }
+    for (DWORD i = 1; i < MAX_IMAGES; i++) {
+        if (!test_textures[i]) {
+            test_textures[i] = test_load_texture(imageName);
+            return (int)i;
+        }
+    }
+    return 0;
+}
+
+static LPCPLAYER test_get_player_state(void) {
+    return &test_ps;
+}
+
+
+
+static LPRENDERER test_get_renderer(void) {
+    return &test_renderer;
+}
+
+static void test_server_command(LPCSTR text) {
+    snprintf(last_server_command, sizeof(last_server_command), "%s", text ? text : "");
+}
+
+static void test_cmd_execute_text(LPCSTR text) {
+    snprintf(last_cmd_execute_text, sizeof(last_cmd_execute_text), "%s", text ? text : "");
+}
+
+static LPCSTR test_cvar_string(LPCSTR name, LPCSTR fallback) {
+    if (!strcmp(name, BZ_WOW_CVAR_SHOW_TIPS)) return test_show_tips;
+    return fallback;
+}
+
+static void test_cvar_set(LPCSTR name, LPCSTR value) {
+    if (!strcmp(name, BZ_WOW_CVAR_SHOW_TIPS)) snprintf(test_show_tips, sizeof(test_show_tips), "%s", value);
+}
+
+static void reset_test_state(void) {
+    memset(&test_ps, 0, sizeof(test_ps));
+    memset(test_textures, 0, sizeof(test_textures));
+    memset(&test_renderer, 0, sizeof(test_renderer));
+    memset(last_draw_text, 0, sizeof(last_draw_text));
+    memset(last_server_command, 0, sizeof(last_server_command));
+    memset(last_cmd_execute_text, 0, sizeof(last_cmd_execute_text));
+    next_texture_id = 0;
+    loaded_textures = 0;
+    missing_textures = 0;
+    forbidden_texture_loads = 0;
+    draw_panel_count = 0;
+    draw_inventory_count = 0;
+    draw_fill_count = 0;
+    draw_text_count = 0;
+    draw_cursor_count = 0;
+    draw_minimap_count = 0;
+    draw_tip_alert_count = 0;
+    last_panel_width = 0;
+    last_panel_height = 0;
+    last_inventory_width = 0;
+    last_inventory_height = 0;
+    snprintf(test_show_tips, sizeof(test_show_tips), "1");
+
+    test_renderer.LoadTexture = test_load_texture;
+    test_renderer.LoadFont = test_load_font;
+    test_renderer.ReleaseTexture = test_release_texture;
+    test_renderer.GetTextureSize = test_get_texture_size;
+    test_renderer.DrawImage = test_draw_image;
+    test_renderer.DrawImageEx = test_draw_image_ex;
+    test_renderer.DrawFill = test_draw_fill;
+    test_renderer.DrawMinimap = test_draw_minimap;
+    test_renderer.DrawText = test_draw_text;
+    test_renderer.GetTextSize = test_get_text_size;
+
+    test_ps.client_ui_state = CLIENT_UI_GAME;
+    test_ps.name = "LuaTester";
+    test_ps.stats[WOW_STAT_HEALTH] = 77;
+    test_ps.stats[WOW_STAT_HEALTH_MAX] = 100;
+    test_ps.stats[WOW_STAT_POWER] = 55;
+    test_ps.stats[WOW_STAT_POWER_MAX] = 80;
+    test_ps.stats[WOW_STAT_LEVEL] = 9;
+    test_ps.stats[WOW_STAT_SELECTED_ACTION] = 255;
+}
+
+static menuExport_t init_ui(void) {
+    menuExport_t menu;
+
+    menu = M_GetAPI((menuImport_t) { .FS_ReadFile = test_fs_read_file, .FS_FreeFile = test_fs_free_file, .MemAlloc = test_mem_alloc, .MemFree = test_mem_free, .Cmd_ExecuteText = test_cmd_execute_text, .ImageIndex = test_image_index, .ServerCommand = test_server_command, .Cvar_String = test_cvar_string, .Cvar_Set = test_cvar_set, .GetRenderer = test_get_renderer, .Printf = test_printf, });
+    menu.UpdatePlayerState(&test_ps);
+
+    T_NOT_NULL(menu.Init);
+    T_NOT_NULL(menu.Refresh);
+    T_NOT_NULL(menu.Shutdown);
+    menu.Init();
+    return menu;
+}
+
+extern BOOL UIWow_RunLuaString(LPCSTR name, LPCSTR script);
+
+TEST(wow_ui, wow_lua_ui_draws_from_generated_mpq) {
+    menuExport_t menu;
+    menuUnitData_t unit;
+
+    reset_test_state();
+    T_ASSERT(SFileOpenArchive(TEST_WOW_MPQ, 0, 0, &test_archive));
+
+    menu = init_ui();
+    memset(&unit, 0, sizeof(unit));
+    unit.num_inventory = 1;
+    snprintf(unit.inventory[0].art, sizeof(unit.inventory[0].art), "%s", "Interface\\Test\\Inventory.blp");
+    snprintf(unit.inventory[0].tooltip, sizeof(unit.inventory[0].tooltip), "%s", "Inventory");
+    snprintf(unit.inventory[0].ubertip, sizeof(unit.inventory[0].ubertip), "%s", "1");
+    unit.inventory[0].slot = 0;
+    menu.UpdateUnitUI(1, &unit);
+    menu.Refresh(33);
+
+    T_EQ((int)forbidden_texture_loads, 0);
+    T_EQ((int)missing_textures, 0);
+    T_EQ((int)draw_panel_count, 1);
+    T_EQ((int)draw_inventory_count, 1);
+    T_EQ((int)draw_fill_count, 1);
+    T_EQ((int)draw_text_count, 1);
+    T_EQ((int)draw_minimap_count, 1);
+    T_EQ((int)last_panel_width, 16);
+    T_EQ((int)last_panel_height, 8);
+    T_EQ((int)last_inventory_width, 8);
+    T_EQ((int)last_inventory_height, 8);
+    T_STREQ(last_draw_text, "LuaTester:77:33");
+    T_STREQ(last_server_command, "wow_lua_test 9 33");
+
+    menu.Shutdown();
+    FOR_LOOP(i, MAX_IMAGES) {
+        if (test_textures[i]) {
+            test_release_texture((LPTEXTURE)test_textures[i]);
+            test_textures[i] = NULL;
+        }
+    }
+    SFileCloseArchive(test_archive);
+    test_archive = NULL;
+}
+
+TEST(wow_ui, enter_world_delegates_map_selection_to_server_playercreateinfo) {
+    menuExport_t menu;
+
+    reset_test_state();
+    T_ASSERT(SFileOpenArchive(TEST_WOW_MPQ, 0, 0, &test_archive));
+    menu = init_ui();
+    T_ASSERT(UIWow_RunLuaString("enter_world_test", "EnterWorld()"));
+    T_STREQ(last_cmd_execute_text, "map playercreate");
+    menu.Shutdown();
+    SFileCloseArchive(test_archive);
+    test_archive = NULL;
+}
+
+#if 0 /* tutorial presentation is server-authored through svc_window */
+TEST(wow_ui, tutorial_42_uses_global_strings_and_display_tips_cvar) {
+    menuExport_t menu;
+    RECT check, alert1, alert2, frame; int check_idx, frame_idx;
+
+    reset_test_state();
+    T_ASSERT(SFileOpenArchive(TEST_WOW_MPQ, 0, 0, &test_archive));
+    menu = init_ui(); UIWow_EnterGameMode();
+    menu.ShowTutorial(1);
+    menu.ShowTutorial(2);
+    menu.ShowTutorial(1);
+    menu.ShowWindow("TutorialFrame", 1);
+    T_ASSERT(wow_ui.tutorial_open);
+    T_EQ((int)wow_ui.tutorial_alert_count, 2);
+    T_STREQ(wow_ui.tutorial_title, "Welcome to World of Warcraft!");
+    T_ASSERT(strstr(wow_ui.tutorial_body, "help button"));
+    T_STREQ(wow_ui.tutorial_check, "Display Tips");
+    T_STREQ(wow_ui.tutorial_okay, "Okay");
+    frame_idx = UIWow_XmlFindByNamePub("TutorialFrame"); T_ASSERT(frame_idx >= 0);
+    UIWow_XmlComputeRectPub(frame_idx, &frame.x, &frame.y, &frame.w, &frame.h);
+    T_FEQ(frame.h, 0.012f + 62.0f / 768.0f, 0.001f);
+    /* The expanded welcome popup itself stays centered regardless of localized body height. */
+    T_FEQ(frame.y + frame.h * 0.5f, 0.5f, 0.001f);
+    check_idx = UIWow_XmlFindByNamePub("TutorialFrameCheckButton");
+    T_ASSERT(check_idx >= 0);
+    UIWow_XmlComputeRectPub(check_idx, &check.x, &check.y, &check.w, &check.h);
+    T_FEQ(check.w, 24.0f / 1024.0f, 0.001f); T_FEQ(check.h, 24.0f / 768.0f, 0.001f);
+    wow_ui.tutorial_open = false;
+    alert1 = MAKE(RECT, 0.5f-17.0f/1024.0f, 671.0f/768.0f, 34.0f/1024.0f, 42.0f/768.0f);
+    alert2 = alert1; alert2.x += 36.0f/1024.0f;
+    T_FEQ(alert2.x - alert1.x, 36.0f / 1024.0f, 0.001f); T_FEQ(alert2.y, alert1.y, 0.001f);
+    T_ASSERT(menu.MouseEvent(MENU_MOUSE_DOWN, (int)((alert1.x + alert1.w * 0.5f) * 1024.0f), (int)((alert1.y + alert1.h * 0.5f) * 768.0f), 1));
+    T_ASSERT(wow_ui.tutorial_open);
+    T_EQ((int)wow_ui.tutorial_id, 1);
+    T_EQ((int)wow_ui.tutorial_alert_count, 1);
+    UIWow_XmlComputeRectPub(frame_idx, &frame.x, &frame.y, &frame.w, &frame.h);
+    /* Ordinary help restores the native XML anchor 100px above the screen bottom. */
+    T_FEQ(frame.y + frame.h, 1.0f - 100.0f / 768.0f, 0.001f);
+    T_STREQ(wow_ui.tutorial_title, "Questgivers");
+    UIWow_XmlComputeRectPub(check_idx, &check.x, &check.y, &check.w, &check.h);
+    T_ASSERT(UIWow_WindowMouseDown(check.x + check.w * 0.5f, check.y + check.h * 0.5f));
+    T_STREQ(test_show_tips, "0");
+    T_EQ((int)wow_ui.tutorial_alert_count, 0);
+    menu.ShowWindow("TutorialFrame", 0); menu.ShowWindow("TutorialFrame", 1);
+    T_ASSERT(!wow_ui.tutorial_open);
+    menu.ShowTutorial(2);
+    T_EQ((int)wow_ui.tutorial_alert_count, 0);
+    menu.Shutdown(); SFileCloseArchive(test_archive); test_archive = NULL;
+}
+
+TEST(wow_ui, tutorial_okay_closes_on_mouse_up_not_down) {
+    menuExport_t menu;
+    RECT okay; int cx, cy;
+
+    reset_test_state();
+    T_ASSERT(SFileOpenArchive(TEST_WOW_MPQ, 0, 0, &test_archive));
+    menu = init_ui(); UIWow_EnterGameMode();
+    menu.ShowWindow("TutorialFrame", 1);
+    T_ASSERT(wow_ui.tutorial_open);
+    UIWow_TutorialOkayRect(&okay);
+    cx = (int)((okay.x + okay.w * 0.5f) * 1024.0f);
+    cy = (int)((okay.y + okay.h * 0.5f) * 768.0f);
+
+    /* Mouse down over the Okay button only arms the pushed visual; it must not close. */
+    T_ASSERT(menu.MouseEvent(MENU_MOUSE_DOWN, cx, cy, 1));
+    T_ASSERT(wow_ui.tutorial_okay_pressed);
+    T_ASSERT(wow_ui.tutorial_open);
+
+    /* Releasing over the button closes the panel and clears the pressed state. */
+    T_ASSERT(menu.MouseEvent(MENU_MOUSE_UP, cx, cy, 1));
+    T_ASSERT(!wow_ui.tutorial_okay_pressed);
+    T_ASSERT(!wow_ui.tutorial_open);
+
+    /* Pressing and releasing off the button cancels without closing. */
+    menu.ShowWindow("TutorialFrame", 1);
+    T_ASSERT(menu.MouseEvent(MENU_MOUSE_DOWN, cx, cy, 1));
+    T_ASSERT(wow_ui.tutorial_okay_pressed);
+    T_ASSERT(menu.MouseEvent(MENU_MOUSE_UP, 100, 100, 1));
+    T_ASSERT(!wow_ui.tutorial_okay_pressed);
+    T_ASSERT(wow_ui.tutorial_open);
+
+    menu.Shutdown(); SFileCloseArchive(test_archive); test_archive = NULL;
+}
+
+TEST(wow_ui, frame_setpoint_lua_moves_runtime_anchor) {
+    menuExport_t menu; int idx; FLOAT x, y, w, h;
+
+    reset_test_state();
+    T_ASSERT(SFileOpenArchive(TEST_WOW_MPQ, 0, 0, &test_archive));
+    menu = init_ui(); UIWow_EnterGameMode(); menu.ShowWindow("TutorialFrame", 1);
+    T_ASSERT(UIWow_RunLuaString("test SetPoint", "TutorialFrame:SetPoint('BOTTOM', 'UIParent', 'CENTER', 0, -80)"));
+    idx = UIWow_XmlFindByNamePub("TutorialFrame"); UIWow_XmlComputeRectPub(idx, &x, &y, &w, &h);
+    T_FEQ(y + h, 0.5f + 80.0f / 768.0f, 0.001f);
+    menu.Shutdown(); SFileCloseArchive(test_archive); test_archive = NULL;
+}
+#endif

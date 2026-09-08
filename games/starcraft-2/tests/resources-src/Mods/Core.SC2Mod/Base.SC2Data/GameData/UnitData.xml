@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="us-ascii"?>
+<Catalog>
+    <CUnit id="Marine">
+        <Actor value="MarineActor"/>
+        <Footprint value="FootprintCoreMarine"/>
+        <Mover value="None"/>
+        <Radius value="0.25"/>
+    </CUnit>
+    <CUnit id="SupplyDepot">
+        <Actor value="SupplyDepotActor"/>
+        <Footprint value="Footprint2x2"/>
+        <Mover value="Ground"/>
+    </CUnit>
+</Catalog>

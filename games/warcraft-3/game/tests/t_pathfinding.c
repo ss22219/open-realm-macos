@@ -1,0 +1,1063 @@
+#ifdef BZ_TESTS
+/*
+ * test_pathfinding.c — Unit tests for routing.c (heatmap / flow-field).
+ *
+ * Uses setup_test_pathmap() to build synthetic pathmaps without an MPQ
+ * archive, then calls CM_BuildHeatmap() and get_flow_direction() directly.
+ *
+ * Test areas:
+ *   Heatmap cache — same goal returns cached generation; different goal
+ *                   triggers a rebuild (generation advances).
+ *   Static obstacles — nowalk cells are avoided; the heatmap never
+ *                      propagates into a wall cell.
+ *   Unit obstacles separation — a live unit does NOT invalidate the heatmap
+ *                               cache for the same goal (fix #2: unit
+ *                               obstacles are handled by collision, not by
+ *                               the heatmap).
+ *   Multi-goal cache — two different goals each maintain their own cached
+ *                      generation; switching between them does not force a
+ *                      full rebuild every frame (fix #3).
+ *   Flow direction — the flow vector at a cell points toward the goal.
+ *   Static point test — CM_PointIsPathableForRadius rejects wall cells and
+ *                       accepts open ground (the static half of move-time
+ *                       collision; see unit_trymove in g_ai.c).
+ */
+
+#include <math.h>
+#include <string.h>
+#include "test.h"
+#include "../g_local.h"
+
+/* Helpers defined in t_utils.c */
+LPEDICT alloc_test_unit(DWORD class_id, FLOAT x, FLOAT y);
+void reset_entities(void);
+void setup_test_world(void);
+
+
+
+/* -----------------------------------------------------------------------
+ * Symbols from routing.c / g_phys.c used directly by these tests.
+ * --------------------------------------------------------------------- */
+
+/* Defined in routing.c, only compiled for test builds. */
+void setup_test_pathmap(DWORD width, DWORD height, BYTE const *cells);
+
+struct routePerfStats_s;
+void CM_ResetTestPathPerfStats(void);
+extern struct routePerfStats_s CM_GetTestPathPerfStats(void);
+
+/* Public API from routing.c. */
+DWORD  CM_BuildHeatmap(edict_t *goalentity);
+DWORD  CM_BuildHeatmapForRadius(edict_t *goalentity, FLOAT radius);
+DWORD  CM_RequestHeatmapForRadius(edict_t *goalentity, FLOAT radius);
+void   CM_ProcessPathJobs(DWORD work_budget);
+BOOL   CM_ClosestPathablePointForRadius(LPCVECTOR2 location, FLOAT radius, LPVECTOR2 out);
+BOOL   CM_ClosestReachablePointForRadius(LPCVECTOR2 from, LPCVECTOR2 target, FLOAT radius, LPVECTOR2 out);
+BOOL   CM_LineIsWalkableForRadius(LPCVECTOR2 a, LPCVECTOR2 b, FLOAT radius);
+BOOL   CM_FindDirectApproachPointForRadius(LPCVECTOR2 from, LPCVECTOR2 target, FLOAT range, FLOAT radius, LPVECTOR2 out);
+BOOL   CM_FindApproachPointToFootprintForRadius(LPCEDICT target, LPCVECTOR2 from, FLOAT range, FLOAT radius, LPVECTOR2 out);
+BOOL   CM_FindInnerApproachPointToFootprintForRadius(LPCEDICT target, LPCVECTOR2 from, FLOAT range, FLOAT radius, LPVECTOR2 out);
+BOOL   CM_FlowReachedGoal(DWORD generation, FLOAT x, FLOAT y);
+BOOL   CM_FlowCanReach(DWORD generation, FLOAT x, FLOAT y);
+VECTOR2 get_flow_direction(DWORD heatmapindex, float fnx, float fny);
+
+/* Static-map point test from routing.c — the static half of move-time
+ * collision (unit_trymove in g_ai.c). */
+BOOL CM_PointIsPathableForRadius(LPCVECTOR2 location, FLOAT radius);
+
+/* From g_monster.c */
+LPEDICT Waypoint_add(LPCVECTOR2 spot);
+DWORD M_RefreshHeatmap(LPEDICT goal, FLOAT radius);
+
+/* From s_move.c — needed to set up a moving unit. */
+void order_move(LPEDICT self, LPEDICT target);
+void order_patrol(LPEDICT self, LPEDICT target);
+void order_attackmove(LPEDICT self, LPEDICT target);
+BOOL M_MoveIsValid(LPEDICT self, LPCVECTOR2 pos);
+
+/* From m_unit.c */
+void unit_stand(LPEDICT self);
+
+/* -----------------------------------------------------------------------
+ * Test-world helpers
+ *
+ * The test pathmap is 8×8 cells.  World coordinates are 1:1 with cell
+ * coordinates (cell_size = 1) because CM_GetNormalizedMapPosition and
+ * CM_GetDenormalizedMapPosition return identity transforms when called
+ * from game common/world_*.c stubs are absent — routing.c uses them
+ * only to convert; the test harness's world bounds mock covers this.
+ *
+ * We use a 10×10 cell map with a wall column at x=5 to test obstacle
+ * avoidance.
+ * --------------------------------------------------------------------- */
+
+#define MAP_W 10
+#define MAP_H 10
+
+/*  0 = open, 2 = nowalk (bit 1 set, matching pathMapCell_t.nowalk). */
+static BYTE open_map[MAP_W * MAP_H];   /* all open */
+
+/* Wall column at x=5, rows 0-7, leaving rows 8-9 as a gap. */
+static BYTE wall_map[MAP_W * MAP_H];
+
+/* Full wall column at x=5, splitting the map into two unreachable halves. */
+static BYTE split_map[MAP_W * MAP_H];
+
+static void build_open_map(void) {
+    memset(open_map, 0, sizeof(open_map));
+}
+
+static void build_wall_map(void) {
+    memset(wall_map, 0, sizeof(wall_map));
+    for (int y = 0; y < 8; y++) {
+        wall_map[y * MAP_W + 5] = 2; /* nowalk */
+    }
+}
+
+static void build_split_map(void) {
+    memset(split_map, 0, sizeof(split_map));
+    for (int y = 0; y < MAP_H; y++) {
+        split_map[y * MAP_W + 5] = 2; /* nowalk */
+    }
+}
+
+/* The test world maps one world unit to one pathmap cell. */
+static LPEDICT make_waypoint(float cell_x, float cell_y) {
+    VECTOR2 pos = { cell_x, cell_y };
+    return Waypoint_add(&pos);
+}
+
+/* Build the flow field for a goal and remember its generation so flow_at_cell
+ * can pass the real handle (get_flow_direction now activates the field for that
+ * generation rather than reading whatever was globally active). */
+static DWORD g_flow_gen = 0;
+static DWORD build_flow(LPEDICT goal) {
+    g_flow_gen = CM_BuildHeatmap(goal);
+    return g_flow_gen;
+}
+
+/* Query flow direction at a cell in the one-unit-per-cell test world. */
+static VECTOR2 flow_at_cell(float cell_x, float cell_y) {
+    return get_flow_direction(g_flow_gen, cell_x, cell_y);
+}
+
+/* Make a minimal unit that looks "stopped" (no currentmove).
+ * s.model is set to 1 so the entity is not treated as IS_HOLLOW by
+ * G_SolveCollisions (which skips entities with model == 0). */
+static LPEDICT make_unit_at(float x, float y) {
+    LPEDICT ent = alloc_test_unit(MAKEFOURCC('h','p','e','a'), x, y);
+    ent->movetype  = MOVETYPE_STEP;
+    ent->collision = 16.0f;
+    ent->s.model   = 1;
+    ent->stand     = unit_stand;
+    unit_stand(ent);
+    return ent;
+}
+
+/* -----------------------------------------------------------------------
+ * Cache tests
+ * --------------------------------------------------------------------- */
+
+TEST(wc3_pathfinding, heatmap_cache_hit_same_goal) {
+    build_open_map();
+    setup_test_pathmap(MAP_W, MAP_H, open_map);
+    reset_entities();
+
+    LPEDICT wp = make_waypoint(5.0f, 5.0f);
+    DWORD gen1 = CM_BuildHeatmap(wp);
+    DWORD gen2 = CM_BuildHeatmap(wp);
+
+    /* Same goal: generation must be identical — no rebuild. */
+    T_EQ(gen1, gen2);
+}
+
+TEST(wc3_pathfinding, heatmap_cache_hit_same_target_different_waypoint) {
+    build_open_map();
+    setup_test_pathmap(MAP_W, MAP_H, open_map);
+    reset_entities();
+
+    LPEDICT wp1 = make_waypoint(5.0f, 5.0f);
+    LPEDICT wp2 = make_waypoint(5.0f, 5.0f);
+    DWORD gen1 = CM_BuildHeatmap(wp1);
+    DWORD gen2 = CM_BuildHeatmap(wp2);
+
+    T_ASSERT(wp1 != wp2);
+    T_EQ(gen1, gen2);
+}
+
+TEST(wc3_pathfinding, heatmap_cache_perf_same_target_builds_once) {
+    build_open_map();
+    setup_test_pathmap(MAP_W, MAP_H, open_map);
+    reset_entities();
+    CM_ResetTestPathPerfStats();
+
+    LPEDICT wp1 = make_waypoint(5.0f, 5.0f);
+    LPEDICT wp2 = make_waypoint(5.0f, 5.0f);
+    CM_BuildHeatmap(wp1);
+    CM_BuildHeatmap(wp2);
+
+    struct routePerfStats_s stats = CM_GetTestPathPerfStats();
+    T_EQ(stats.cache_misses, 1);
+    T_EQ(stats.cache_hits, 1);
+    T_EQ(stats.heatmap_iterations, MAP_W * MAP_H);
+    T_EQ(stats.flow_cells_computed, 0);
+
+    /* Route creation caches prices only; flow work is local to a query. */
+    (void)get_flow_direction(CM_BuildHeatmap(wp1), 2.0f, 5.0f);
+    stats = CM_GetTestPathPerfStats();
+    T_ASSERT(stats.flow_cells_computed > 0);
+    T_ASSERT(stats.flow_cells_computed <= 4);
+}
+
+TEST(wc3_pathfinding, heatmap_cache_miss_different_goal) {
+    build_open_map();
+    setup_test_pathmap(MAP_W, MAP_H, open_map);
+    reset_entities();
+
+    LPEDICT wp1 = make_waypoint(2.0f, 2.0f);
+    LPEDICT wp2 = make_waypoint(7.0f, 7.0f);
+    DWORD gen1 = CM_BuildHeatmap(wp1);
+    DWORD gen2 = CM_BuildHeatmap(wp2);
+
+    /* Different goals must produce different generations. */
+    T_ASSERT(gen1 != gen2);
+}
+
+TEST(wc3_pathfinding, heatmap_generation_is_nonzero) {
+    build_open_map();
+    setup_test_pathmap(MAP_W, MAP_H, open_map);
+    reset_entities();
+
+    LPEDICT wp = make_waypoint(3.0f, 3.0f);
+    DWORD gen = CM_BuildHeatmap(wp);
+
+    T_ASSERT(gen != 0);
+}
+
+/* Static pathing rebuilds invalidate the cache while route entities may still
+ * retain their old generation handle.  A replacement field must never recycle
+ * that handle or CM_ActivateCachedFlow could bind the stale route to unrelated
+ * post-build prices. */
+TEST(wc3_pathfinding, invalidation_does_not_recycle_heatmap_generation) {
+    build_open_map();
+    setup_test_pathmap(MAP_W, MAP_H, open_map);
+    reset_entities();
+
+    LPEDICT first = make_waypoint(2.0f, 2.0f);
+    LPEDICT second = make_waypoint(7.0f, 7.0f);
+    DWORD old_gen = CM_BuildHeatmap(first);
+
+    T_ASSERT(old_gen != 0);
+    CM_InvalidatePathCache();
+    T_ASSERT(!CM_ActivateCachedFlow(old_gen));
+
+    DWORD new_gen = CM_BuildHeatmap(second);
+    T_ASSERT(new_gen != 0);
+    T_ASSERT(new_gen != old_gen);
+    T_ASSERT(!CM_ActivateCachedFlow(old_gen));
+    T_ASSERT(CM_ActivateCachedFlow(new_gen));
+}
+
+TEST(wc3_pathfinding, incremental_heatmap_serializes_cache_misses_without_losing_later_goal) {
+    build_open_map();
+    setup_test_pathmap(MAP_W, MAP_H, open_map);
+    reset_entities();
+    CM_ResetTestPathPerfStats();
+
+    LPEDICT first = make_waypoint(2.0f, 2.0f);
+    LPEDICT second = make_waypoint(7.0f, 7.0f);
+
+    /* A cache miss only queues work; a second goal waits rather than being
+     * permanently denied by the old lifetime two-build quota. */
+    T_EQ(CM_RequestHeatmapForRadius(first, 0.0f), 0);
+    T_EQ(CM_RequestHeatmapForRadius(second, 0.0f), 0);
+
+    for (int i = 0; i < 200; i++)
+        CM_ProcessPathJobs(4);
+
+    DWORD first_gen = CM_RequestHeatmapForRadius(first, 0.0f);
+    T_ASSERT(first_gen != 0);
+
+    /* Once the first job completes, the previously waiting destination can
+     * start on the next request and eventually gets its own generation. */
+    T_EQ(CM_RequestHeatmapForRadius(second, 0.0f), 0);
+    for (int i = 0; i < 200; i++)
+        CM_ProcessPathJobs(4);
+
+    DWORD second_gen = CM_RequestHeatmapForRadius(second, 0.0f);
+    T_ASSERT(second_gen != 0);
+    T_ASSERT(second_gen != first_gen);
+}
+
+TEST(wc3_pathfinding, production_budget_completes_large_open_field_in_two_frames) {
+    enum { WIDTH = 256, HEIGHT = 256 };
+    static BYTE open[WIDTH * HEIGHT];
+    LPEDICT goal;
+
+    memset(open, 0, sizeof(open));
+    setup_test_pathmap(WIDTH, HEIGHT, open);
+    reset_entities();
+    goal = make_waypoint(128.0f, 128.0f);
+
+    T_EQ(CM_RequestHeatmapForRadius(goal, 0.0f), 0);
+    CM_ProcessPathJobs(WC3_PATH_WORK_BUDGET);
+    if (!CM_RequestHeatmapForRadius(goal, 0.0f))
+        CM_ProcessPathJobs(WC3_PATH_WORK_BUDGET);
+    T_ASSERT(CM_RequestHeatmapForRadius(goal, 0.0f) != 0);
+}
+
+TEST(wc3_pathfinding, nearby_detour_accelerator_returns_clear_waypoint) {
+    VECTOR2 from = {2.0f, 5.0f}, target = {7.0f, 5.0f}, waypoint;
+    pathAccelParams_t params = { &from, &target, 0.0f };
+
+    build_wall_map();
+    setup_test_pathmap(MAP_W, MAP_H, wall_map);
+    T_ASSERT(!CM_LineIsWalkableForRadius(&from, &target, 0.0f));
+    T_ASSERT(CM_FindPathWaypoint(&params, &waypoint));
+    T_ASSERT(CM_LineIsWalkableForRadius(&from, &waypoint, 0.0f));
+    T_ASSERT(waypoint.y > 7.0f);
+}
+
+TEST(wc3_pathfinding, distant_detour_skips_bounded_accelerator) {
+    enum { WIDTH = 128, HEIGHT = 16 };
+    static BYTE open[WIDTH * HEIGHT];
+    VECTOR2 from = {2.0f, 8.0f}, target = {100.0f, 8.0f}, waypoint;
+    pathAccelParams_t params = { &from, &target, 0.0f };
+
+    memset(open, 0, sizeof(open));
+    setup_test_pathmap(WIDTH, HEIGHT, open);
+    T_ASSERT(!CM_FindPathWaypoint(&params, &waypoint));
+}
+
+TEST(wc3_pathfinding, nearby_detour_accelerator_respects_collision_radius) {
+    BYTE narrow[MAP_W * MAP_H];
+    VECTOR2 from = {2.0f, 5.0f}, target = {7.0f, 5.0f}, waypoint;
+    pathAccelParams_t point = { &from, &target, 0.0f };
+    pathAccelParams_t wide = { &from, &target, 1.0f };
+
+    memset(narrow, 0, sizeof(narrow));
+    FOR_LOOP(y, MAP_H) narrow[5 + y * MAP_W] = 0x02;
+    narrow[5 + 5 * MAP_W] = 0;
+    setup_test_pathmap(MAP_W, MAP_H, narrow);
+    T_ASSERT(CM_FindPathWaypoint(&point, &waypoint));
+    T_ASSERT(!CM_FindPathWaypoint(&wide, &waypoint));
+}
+
+TEST(wc3_pathfinding, heatmap_cache_separates_collision_radius) {
+    build_open_map();
+    setup_test_pathmap(MAP_W, MAP_H, open_map);
+    reset_entities();
+
+    LPEDICT wp = make_waypoint(5.0f, 5.0f);
+    DWORD point_gen = CM_BuildHeatmapForRadius(wp, 0.0f);
+    DWORD wide_gen = CM_BuildHeatmapForRadius(wp, 1.0f);
+
+    T_ASSERT(point_gen != 0);
+    T_ASSERT(wide_gen != 0);
+    T_ASSERT(point_gen != wide_gen);
+}
+
+/* -----------------------------------------------------------------------
+ * Multi-goal cache (fix #3): switching between two known goals should
+ * not force a full rebuild every time; each goal keeps its own cached
+ * generation.
+ * --------------------------------------------------------------------- */
+
+TEST(wc3_pathfinding, multi_goal_cache_no_thrash) {
+    /* Must call setup_test_pathmap once only — it resets the cache. */
+    build_open_map();
+    setup_test_pathmap(MAP_W, MAP_H, open_map);
+
+    /* Use distinct waypoint slots from the global pool so pointers differ. */
+    LPEDICT wp_a = make_waypoint(1.0f, 1.0f);
+    LPEDICT wp_b = make_waypoint(8.0f, 8.0f);
+
+    /* Verify the two waypoints are actually different pointers. */
+    T_ASSERT(wp_a != wp_b);
+
+    /* Build both goals once — they each occupy a cache slot. */
+    DWORD gen_a1 = CM_BuildHeatmap(wp_a);
+    DWORD gen_b1 = CM_BuildHeatmap(wp_b);
+
+    /* Both goals are different so their generations must differ. */
+    T_ASSERT(gen_a1 != gen_b1);
+
+    /* Switch back to each — both should hit the cache (same generation). */
+    DWORD gen_a2 = CM_BuildHeatmap(wp_a);
+    DWORD gen_b2 = CM_BuildHeatmap(wp_b);
+
+    T_EQ(gen_a1, gen_a2);
+    T_EQ(gen_b1, gen_b2);
+}
+
+TEST(wc3_pathfinding, heatmap_cache_ignores_stale_dynamic_pathmap_stamps) {
+    build_open_map();
+    setup_test_pathmap(MAP_W, MAP_H, open_map);
+    reset_entities();
+
+    LPEDICT wp1 = make_waypoint(5.0f, 5.0f);
+    DWORD gen1 = CM_BuildHeatmap(wp1);
+
+    LPEDICT unit = make_unit_at(wp1->s.origin.x, wp1->s.origin.y);
+    VECTOR2 pathable;
+    CM_ClosestPathablePointForRadius(&wp1->s.origin2, unit->collision, &pathable);
+
+    LPEDICT wp2 = make_waypoint(5.0f, 5.0f);
+    DWORD gen2 = CM_BuildHeatmap(wp2);
+
+    T_EQ(gen1, gen2);
+}
+
+TEST(wc3_pathfinding, heatmap_build_does_not_bake_whole_flow_field) {
+    build_split_map();
+    setup_test_pathmap(MAP_W, MAP_H, split_map);
+    reset_entities();
+    CM_ResetTestPathPerfStats();
+
+    LPEDICT wp = make_waypoint(7.0f, 5.0f);
+    CM_BuildHeatmap(wp);
+
+    struct routePerfStats_s stats = CM_GetTestPathPerfStats();
+    T_EQ(stats.cache_misses, 1);
+    T_EQ(stats.cache_hits, 0);
+    T_EQ(stats.heatmap_iterations, (MAP_W - 6) * MAP_H);
+    T_EQ(stats.flow_cells_computed, 0);
+
+    (void)get_flow_direction(CM_BuildHeatmap(wp), 7.0f, 5.0f);
+    stats = CM_GetTestPathPerfStats();
+    T_ASSERT(stats.flow_cells_computed > 0);
+    T_ASSERT(stats.flow_cells_computed <= 4);
+}
+
+TEST(wc3_pathfinding, flow_reachability_distinguishes_disconnected_component) {
+    build_split_map();
+    setup_test_pathmap(MAP_W, MAP_H, split_map);
+    reset_entities();
+
+    LPEDICT wp = make_waypoint(7.0f, 5.0f);
+    DWORD gen = CM_BuildHeatmap(wp);
+
+    T_ASSERT(CM_FlowCanReach(gen, 7.0f, 5.0f));
+    T_ASSERT(!CM_FlowCanReach(gen, 3.0f, 5.0f));
+}
+
+/* -----------------------------------------------------------------------
+ * Static obstacle tests
+ * --------------------------------------------------------------------- */
+
+TEST(wc3_pathfinding, wall_routes_flow_around_obstacle) {
+    build_wall_map();
+    setup_test_pathmap(MAP_W, MAP_H, wall_map);
+    reset_entities();
+
+    /* Goal on the right side of the wall at (7, 5), reachable only through
+     * the gap at y=8 or y=9.  Sample flow at (3, 5): left side of wall.
+     * The direct rightward path is blocked, so the flow must deviate — it
+     * should NOT point straight right (+x only) through the wall; it will
+     * bend toward the gap at y=8/9, giving a downward (y) component.
+     * We also verify the goal IS reachable from the right side (7,5). */
+    LPEDICT wp = make_waypoint(7.0f, 5.0f);
+    build_flow(wp);
+
+    /* Flow at (7, 5) itself is zero by contract.  Flow at (8, 5) — right
+     * side, open — should point toward the goal
+     * i.e. leftward (-x component). */
+    VECTOR2 dir_right = flow_at_cell(8.0f, 5.0f);
+    T_ASSERT(dir_right.x < 0.0f);
+
+    /* Flow at (3, 5) — left of wall — must have a non-zero y component
+     * to route around the wall (can't go straight right). */
+    VECTOR2 dir_left = flow_at_cell(3.0f, 5.0f);
+    T_ASSERT(dir_left.y != 0.0f || dir_left.x != 0.0f);
+}
+
+TEST(wc3_pathfinding, flow_direction_points_toward_goal_open) {
+    build_open_map();
+    setup_test_pathmap(MAP_W, MAP_H, open_map);
+    reset_entities();
+
+    /* Goal at right edge; sample from left side. */
+    LPEDICT wp = make_waypoint(9.0f, 5.0f);
+    build_flow(wp);
+
+    /* At cell (2, 5), flow should point roughly rightward (+x). */
+    VECTOR2 dir = flow_at_cell(2.0f, 5.0f);
+    T_ASSERT(dir.x > 0.0f);
+}
+
+TEST(wc3_pathfinding, flow_goal_has_no_outward_direction) {
+    build_open_map();
+    setup_test_pathmap(MAP_W, MAP_H, open_map);
+    reset_entities();
+
+    LPEDICT wp = make_waypoint(5.0f, 5.0f);
+    DWORD gen = CM_BuildHeatmap(wp);
+    VECTOR2 dir = get_flow_direction(gen, 5.0f, 5.0f);
+
+    T_ASSERT(CM_FlowReachedGoal(gen, 5.0f, 5.0f));
+    T_FEQ(dir.x, 0.0f, 0.001f);
+    T_FEQ(dir.y, 0.0f, 0.001f);
+}
+
+TEST(wc3_pathfinding, flow_goal_reports_adjusted_blocked_target_cell) {
+    BYTE blocked_goal[MAP_W * MAP_H];
+    memset(blocked_goal, 0, sizeof(blocked_goal));
+    blocked_goal[5 * MAP_W + 5] = 2;
+    setup_test_pathmap(MAP_W, MAP_H, blocked_goal);
+    reset_entities();
+
+    LPEDICT wp = make_waypoint(5.0f, 5.0f);
+    DWORD gen = CM_BuildHeatmap(wp);
+
+    T_ASSERT(gen != 0);
+    T_ASSERT(!CM_FlowReachedGoal(gen, 5.0f, 5.0f));
+    /* Deterministic closest_pathable_node scans the upper ring first. */
+    T_ASSERT(CM_FlowReachedGoal(gen, 5.0f, 4.0f) ||
+             CM_FlowReachedGoal(gen, 4.0f, 4.0f));
+}
+
+/* Point routes are used for interactions whose real target can be blocked,
+ * such as a Gold Mine or Town Hall centre.  The adjusted route-end cell must
+ * not produce a vector back out into the map: all workers sharing that field
+ * would otherwise orbit the same wrong location instead of completing the
+ * behavior-owned footprint/range interaction. */
+TEST(wc3_pathfinding, point_flow_adjusted_goal_has_no_outward_direction) {
+    BYTE blocked_goal[MAP_W * MAP_H];
+    FLOAT goal_x = 5.0f, goal_y = 4.0f;
+    VECTOR2 dir;
+
+    memset(blocked_goal, 0, sizeof(blocked_goal));
+    blocked_goal[5 * MAP_W + 5] = 2;
+    setup_test_pathmap(MAP_W, MAP_H, blocked_goal);
+    reset_entities();
+
+    LPEDICT wp = make_waypoint(5.0f, 5.0f);
+    DWORD gen = CM_BuildHeatmap(wp);
+
+    T_ASSERT(gen != 0);
+    if (!CM_FlowReachedGoal(gen, goal_x, goal_y)) {
+        goal_x = 4.0f;
+        goal_y = 4.0f;
+    }
+    T_ASSERT(CM_FlowReachedGoal(gen, goal_x, goal_y));
+    dir = get_flow_direction(gen, goal_x, goal_y);
+    T_FEQ(dir.x, 0.0f, 0.001f);
+    T_FEQ(dir.y, 0.0f, 0.001f);
+}
+
+/* Generic interactions intentionally use a radius-zero field and own their
+ * final range test.  Reaching the field's adjusted target is therefore not an
+ * unreachable/stall state: steering must expose that route-end and continue
+ * toward the real entity target so mine entry, resource deposit, attack range,
+ * and similar behavior checks can finish. */
+TEST(wc3_pathfinding, interaction_point_route_reports_adjusted_goal) {
+    BYTE blocked_goal[MAP_W * MAP_H];
+    FLOAT goal_x = 5.0f, goal_y = 4.0f;
+
+    memset(blocked_goal, 0, sizeof(blocked_goal));
+    blocked_goal[5 * MAP_W + 5] = 2;
+    setup_test_pathmap(MAP_W, MAP_H, blocked_goal);
+    reset_entities();
+
+    LPEDICT target = make_waypoint(5.0f, 5.0f);
+    DWORD gen = CM_BuildHeatmap(target);
+    T_ASSERT(gen != 0);
+    if (!CM_FlowReachedGoal(gen, goal_x, goal_y)) {
+        goal_x = 4.0f;
+        goal_y = 4.0f;
+    }
+    T_ASSERT(CM_FlowReachedGoal(gen, goal_x, goal_y));
+
+    LPEDICT unit = make_unit_at(goal_x, goal_y);
+    unit->collision = 0.0f;
+    unit->goalentity = target;
+    target->heatmap2 = gen;
+    target->heatmap2_radius = 0.0f;
+
+    unit_changeangle(unit);
+
+    T_EQ(unit->movement.flow_generation, gen);
+    T_ASSERT(unit->movement.flow_goal_reached);
+    T_ASSERT(!unit->movement.flow_unreachable);
+}
+
+TEST(wc3_pathfinding, line_walkability_respects_collision_radius) {
+    BYTE corridor[MAP_W * MAP_H];
+    memset(corridor, 0, sizeof(corridor));
+    for (int x = 0; x < MAP_W; x++) {
+        corridor[4 * MAP_W + x] = 2;
+        corridor[6 * MAP_W + x] = 2;
+    }
+    setup_test_pathmap(MAP_W, MAP_H, corridor);
+    reset_entities();
+
+    VECTOR2 a = { 1.0f, 5.0f };
+    VECTOR2 b = { 8.0f, 5.0f };
+    T_ASSERT(CM_LineIsWalkableForRadius(&a, &b, 0.0f));
+    T_ASSERT(!CM_LineIsWalkableForRadius(&a, &b, 1.0f));
+}
+
+TEST(wc3_pathfinding, direct_approach_stops_before_blocked_target_center) {
+    BYTE blocked_target[MAP_W * MAP_H];
+    VECTOR2 from = { 1.0f, 5.0f };
+    VECTOR2 target = { 5.0f, 5.0f };
+    VECTOR2 approach = { 0 };
+
+    memset(blocked_target, 0, sizeof(blocked_target));
+    blocked_target[5 * MAP_W + 5] = 2;
+    setup_test_pathmap(MAP_W, MAP_H, blocked_target);
+    reset_entities();
+
+    T_ASSERT(CM_FindDirectApproachPointForRadius(&from, &target, 2.0f, 0.0f, &approach));
+    T_ASSERT(Vector2_distance(&approach, &target) <= 2.0f);
+    T_ASSERT(CM_PointIsPathableForRadius(&approach, 0.0f));
+    T_ASSERT(CM_LineIsWalkableForRadius(&from, &approach, 0.0f));
+}
+
+
+TEST(wc3_pathfinding, footprint_approach_returns_legal_point_beside_blocked_building) {
+    BYTE blocked_target[MAP_W * MAP_H];
+    LPEDICT building;
+    pathTex_t *pathtex;
+    VECTOR2 from = { 1.0f, 5.0f };
+    VECTOR2 approach = { 0 };
+
+    memset(blocked_target, 0, sizeof(blocked_target));
+    blocked_target[5 * MAP_W + 5] = 2;
+    setup_test_pathmap(MAP_W, MAP_H, blocked_target);
+    reset_entities();
+
+    building = alloc_test_unit(MAKEFOURCC('h','b','a','r'), 5.0f, 5.0f);
+    pathtex = gi.MemAlloc(sizeof(*pathtex) + sizeof(COLOR32));
+    T_NOT_NULL(pathtex);
+    pathtex->width = 1;
+    pathtex->height = 1;
+    pathtex->map[0] = (COLOR32){ 0, 0, 255, 255 };
+    building->pathtex = pathtex;
+
+    T_ASSERT(CM_FindApproachPointToFootprintForRadius(building, &from, 2.0f, 0.0f, &approach));
+    T_ASSERT(CM_DistanceToPathingFootprint(building, &approach) <= 2.0f);
+    T_ASSERT(CM_PointIsPathableForRadius(&approach, 0.0f));
+
+    building->pathtex = NULL;
+    gi.MemFree(pathtex);
+}
+
+/* The generic footprint helper intentionally chooses the candidate closest to
+ * the mover, which is useful for adaptive staging but can be the OUTERMOST
+ * legal point in a broad interaction band.  Return Resources needs the inverse
+ * ordering: choose the innermost legal ring first, then preserve the worker's
+ * side among points on that ring. */
+TEST(wc3_pathfinding, footprint_inner_approach_prefers_contact_ring_over_outer_staging) {
+    BYTE blocked_target[MAP_W * MAP_H];
+    LPEDICT building;
+    pathTex_t *pathtex;
+    VECTOR2 from = { 0.5f, 5.5f };
+    VECTOR2 staging = { 0 }, inner = { 0 };
+
+    memset(blocked_target, 0, sizeof(blocked_target));
+    blocked_target[5 * MAP_W + 5] = 2;
+    setup_test_pathmap(MAP_W, MAP_H, blocked_target);
+    reset_entities();
+
+    building = alloc_test_unit(MAKEFOURCC('h','b','a','r'), 5.0f, 5.0f);
+    pathtex = gi.MemAlloc(sizeof(*pathtex) + sizeof(COLOR32));
+    T_NOT_NULL(pathtex);
+    pathtex->width = 1;
+    pathtex->height = 1;
+    pathtex->map[0] = (COLOR32){ 0, 0, 255, 255 };
+    building->pathtex = pathtex;
+
+    T_ASSERT(CM_FindApproachPointToFootprintForRadius(
+        building, &from, 3.0f, 0.0f, &staging));
+    T_ASSERT(CM_FindInnerApproachPointToFootprintForRadius(
+        building, &from, 3.0f, 0.0f, &inner));
+    T_ASSERT(CM_DistanceToPathingFootprint(building, &inner) <
+             CM_DistanceToPathingFootprint(building, &staging));
+    T_ASSERT(inner.x > staging.x); /* both are on the worker's left/near side */
+    T_ASSERT(inner.x < building->s.origin2.x);
+
+    building->pathtex = NULL;
+    gi.MemFree(pathtex);
+}
+
+/* The fast footprint-approach mask must preserve irregular/sparse pathing
+ * textures exactly.  A bounding-box shortcut would incorrectly accept the
+ * open middle of this five-cell texture even though it is outside range of
+ * either authored blocked pixel. */
+TEST(wc3_pathfinding, footprint_approach_respects_sparse_path_texture) {
+    BYTE blocked_target[MAP_W * MAP_H];
+    LPEDICT building;
+    pathTex_t *pathtex;
+    VECTOR2 from = { 5.5f, 5.5f };
+    VECTOR2 approach = { 0 };
+
+    memset(blocked_target, 0, sizeof(blocked_target));
+    blocked_target[5 * MAP_W + 3] = 2;
+    blocked_target[5 * MAP_W + 7] = 2;
+    setup_test_pathmap(MAP_W, MAP_H, blocked_target);
+    reset_entities();
+
+    building = alloc_test_unit(MAKEFOURCC('h','b','a','r'), 5.0f, 5.0f);
+    pathtex = gi.MemAlloc(sizeof(*pathtex) + 5 * sizeof(COLOR32));
+    T_NOT_NULL(pathtex);
+    pathtex->width = 5;
+    pathtex->height = 1;
+    FOR_LOOP(i, 5)
+        pathtex->map[i] = (COLOR32){ 0, 0, 0, 255 };
+    pathtex->map[0].b = 255;
+    pathtex->map[4].b = 255;
+    building->pathtex = pathtex;
+
+    T_ASSERT(CM_FindApproachPointToFootprintForRadius(
+        building, &from, 0.6f, 0.0f, &approach));
+    T_ASSERT(CM_DistanceToPathingFootprint(building, &approach) <= 0.6f);
+    T_ASSERT(fabsf(approach.x - from.x) >= 0.9f);
+    T_ASSERT(CM_PointIsPathableForRadius(&approach, 0.0f));
+
+    building->pathtex = NULL;
+    gi.MemFree(pathtex);
+}
+
+TEST(wc3_pathfinding, heatmap_rejects_corridor_too_narrow_for_radius) {
+    BYTE corridor[MAP_W * MAP_H];
+    memset(corridor, 2, sizeof(corridor));
+    for (int x = 0; x < MAP_W; x++)
+        corridor[5 * MAP_W + x] = 0;
+    setup_test_pathmap(MAP_W, MAP_H, corridor);
+    reset_entities();
+
+    LPEDICT wp = make_waypoint(8.0f, 5.0f);
+    T_ASSERT(CM_BuildHeatmapForRadius(wp, 0.0f) != 0);
+    T_EQ(CM_BuildHeatmapForRadius(wp, 1.0f), 0);
+}
+
+/* Move steering and move-time collision must use the same footprint.  A point
+ * route fits through this one-cell opening, but a radius-one unit does not. */
+TEST(wc3_pathfinding, move_order_requests_collision_sized_route) {
+    BYTE gap_map[MAP_W * MAP_H];
+    memset(gap_map, 0, sizeof(gap_map));
+    for (int y = 2; y <= 6; y++)
+        if (y != 5) gap_map[y * MAP_W + 5] = 2;
+    setup_test_pathmap(MAP_W, MAP_H, gap_map);
+    reset_entities();
+
+    LPEDICT unit = make_unit_at(2.0f, 5.0f);
+    LPEDICT wp = make_waypoint(8.0f, 5.0f);
+    unit->collision = 1.0f;
+    order_move(unit, wp);
+
+    T_ASSERT(CM_LineIsWalkableForRadius(&unit->s.origin2, &wp->s.origin2, 0.0f));
+    T_ASSERT(!CM_LineIsWalkableForRadius(&unit->s.origin2, &wp->s.origin2, unit->collision));
+    T_ASSERT(CM_BuildHeatmapForRadius(wp, unit->collision));
+    unit_changeangle(unit);
+    T_FEQ(wp->heatmap2_radius, unit->collision, 0.001f);
+}
+
+TEST(wc3_pathfinding, patrol_requests_collision_sized_route) {
+    BYTE gap_map[MAP_W * MAP_H];
+    memset(gap_map, 0, sizeof(gap_map));
+    for (int y = 2; y <= 6; y++)
+        if (y != 5) gap_map[y * MAP_W + 5] = 2;
+    setup_test_pathmap(MAP_W, MAP_H, gap_map);
+    reset_entities();
+
+    LPEDICT unit = make_unit_at(2.0f, 5.0f);
+    LPEDICT wp = make_waypoint(8.0f, 5.0f);
+    unit->collision = 1.0f;
+    order_patrol(unit, wp);
+    T_ASSERT(CM_BuildHeatmapForRadius(wp, unit->collision));
+    unit_changeangle(unit);
+
+    T_FEQ(wp->heatmap2_radius, unit->collision, 0.001f);
+}
+
+TEST(wc3_pathfinding, attack_move_requests_collision_sized_route) {
+    BYTE gap_map[MAP_W * MAP_H];
+    memset(gap_map, 0, sizeof(gap_map));
+    for (int y = 2; y <= 6; y++)
+        if (y != 5) gap_map[y * MAP_W + 5] = 2;
+    setup_test_pathmap(MAP_W, MAP_H, gap_map);
+    reset_entities();
+
+    LPEDICT unit = make_unit_at(2.0f, 5.0f);
+    LPEDICT wp = make_waypoint(8.0f, 5.0f);
+    unit->collision = 1.0f;
+    order_attackmove(unit, wp);
+    T_ASSERT(CM_BuildHeatmapForRadius(wp, unit->collision));
+    unit_changeangle(unit);
+
+    T_FEQ(wp->heatmap2_radius, unit->collision, 0.001f);
+}
+
+/* -----------------------------------------------------------------------
+ * Unit-obstacle separation (fix #2):
+ * A live unit entity at a given location must NOT cause the heatmap for
+ * the same goal to be rebuilt (unit obstacles are handled by collision
+ * resolution, not the heatmap).  We verify by checking that calling
+ * CM_BuildHeatmap twice with a unit present returns the same generation.
+ * --------------------------------------------------------------------- */
+
+TEST(wc3_pathfinding, unit_presence_does_not_invalidate_heatmap_cache) {
+    build_open_map();
+    setup_test_pathmap(MAP_W, MAP_H, open_map);
+    reset_entities();
+
+    LPEDICT wp   = make_waypoint(7.0f, 5.0f);
+    LPEDICT unit = make_unit_at(3.0f, 5.0f);
+    (void)unit;
+
+    DWORD gen1 = CM_BuildHeatmap(wp);
+    DWORD gen2 = CM_BuildHeatmap(wp);
+
+    T_EQ(gen1, gen2);
+}
+
+/* -----------------------------------------------------------------------
+ * Static-map point test (CM_PointIsPathableForRadius):
+ *
+ * The static half of move-time collision.  A point on a wall cell is not
+ * pathable; open ground is.  World coordinates are cell/MAP in the test
+ * harness (same convention as make_waypoint).
+ * --------------------------------------------------------------------- */
+
+TEST(wc3_pathfinding, point_pathable_rejects_wall_accepts_open) {
+    build_wall_map();
+    setup_test_pathmap(MAP_W, MAP_H, wall_map);
+    reset_entities();
+
+    VECTOR2 wall_pt = { 5.0f, 5.0f }; /* on the wall column */
+    VECTOR2 open_pt = { 2.0f, 5.0f }; /* clear ground */
+
+    T_ASSERT(!CM_PointIsPathableForRadius(&wall_pt, 0.0f));
+    T_ASSERT(CM_PointIsPathableForRadius(&open_pt, 0.0f));
+}
+
+TEST(wc3_pathfinding, closest_pathable_keeps_exact_open_point) {
+    VECTOR2 point = { 2.25f, 5.75f }, out = {0};
+    build_open_map();
+    setup_test_pathmap(MAP_W, MAP_H, open_map);
+    T_ASSERT(CM_ClosestPathablePointForRadius(&point, 0, &out));
+    T_FEQ(out.x, point.x, 0.001f);
+    T_FEQ(out.y, point.y, 0.001f);
+}
+
+/* Dead units/buildings are hollow and must not be reintroduced by the
+ * command-time dynamic obstacle pass after their static footprint is gone. */
+TEST(wc3_pathfinding, closest_pathable_ignores_dead_dynamic_unit) {
+    VECTOR2 point = { 2.0f, 5.0f }, live_out = {0}, dead_out = {0};
+    LPEDICT blocker;
+
+    build_open_map();
+    setup_test_pathmap(MAP_W, MAP_H, open_map);
+    reset_entities();
+    blocker = make_unit_at(point.x, point.y);
+    blocker->svflags |= SVF_MONSTER;
+    blocker->collision = 0.5f;
+
+    T_ASSERT(CM_ClosestPathablePointForRadius(&point, 0, &live_out));
+    T_ASSERT(fabsf(live_out.x - point.x) > 0.001f ||
+             fabsf(live_out.y - point.y) > 0.001f);
+
+    blocker->svflags |= SVF_DEADMONSTER;
+    T_ASSERT(CM_ClosestPathablePointForRadius(&point, 0, &dead_out));
+    T_FEQ(dead_out.x, point.x, 0.001f);
+    T_FEQ(dead_out.y, point.y, 0.001f);
+}
+
+TEST(wc3_pathfinding, closest_reachable_keeps_exact_reachable_point) {
+    VECTOR2 from = { 1.25f, 5.25f }, target = { 3.75f, 5.75f }, out = {0};
+    build_open_map();
+    setup_test_pathmap(MAP_W, MAP_H, open_map);
+
+    T_ASSERT(CM_ClosestReachablePointForRadius(&from, &target, 0.0f, &out));
+    T_FEQ(out.x, target.x, 0.001f);
+    T_FEQ(out.y, target.y, 0.001f);
+}
+
+TEST(wc3_pathfinding, closest_reachable_stops_at_disconnected_wall) {
+    VECTOR2 from = { 1.5f, 5.5f }, target = { 8.5f, 5.5f }, out = {0};
+    build_split_map();
+    setup_test_pathmap(MAP_W, MAP_H, split_map);
+
+    T_ASSERT(CM_ClosestReachablePointForRadius(&from, &target, 0.0f, &out));
+    T_FEQ(out.x, 4.5f, 0.001f);
+    T_FEQ(out.y, 5.5f, 0.001f);
+}
+
+TEST(wc3_pathfinding, closest_reachable_respects_collision_radius) {
+    VECTOR2 from = { 1.5f, 5.5f }, target = { 8.5f, 5.5f }, out = {0};
+    build_split_map();
+    setup_test_pathmap(MAP_W, MAP_H, split_map);
+
+    T_ASSERT(CM_ClosestReachablePointForRadius(&from, &target, 1.0f, &out));
+    T_FEQ(out.x, 3.5f, 0.001f);
+    T_FEQ(out.y, 5.5f, 0.001f);
+}
+
+/* The flood and the flow must not cut diagonally through a wall corner: with
+ * walls at (1,0) and (0,1), the cell (0,0) is boxed off from a goal at (1,1)
+ * (squeezing the corner is not a legal move), so its flow is zero, not a
+ * diagonal pointing into the corner. */
+TEST(wc3_pathfinding, no_diagonal_corner_cutting) {
+    BYTE corner_map[MAP_W * MAP_H];
+    memset(corner_map, 0, sizeof(corner_map));
+    corner_map[0 * MAP_W + 1] = 2;  /* wall at (1,0) */
+    corner_map[1 * MAP_W + 0] = 2;  /* wall at (0,1) */
+    setup_test_pathmap(MAP_W, MAP_H, corner_map);
+    reset_entities();
+
+    LPEDICT wp = make_waypoint(1.0f, 1.0f);  /* goal at cell (1,1) */
+    build_flow(wp);
+
+    VECTOR2 flow = flow_at_cell(0.0f, 0.0f);
+    T_FEQ(flow.x, 0.0f, 0.001f);
+    T_FEQ(flow.y, 0.0f, 0.001f);
+}
+
+/* The direct-line shortcut must obey the same corner rule as the flow field.
+ * Otherwise generic movement bypasses routing for the exact ox/xo fence shape
+ * and repeatedly asks collision to enter the blocked diagonal gap. */
+TEST(wc3_pathfinding, direct_line_rejects_diagonal_corner_cutting) {
+    BYTE corner_map[MAP_W * MAP_H];
+    VECTOR2 start = { 0.5f, 0.5f };
+    VECTOR2 goal = { 1.5f, 1.5f };
+    memset(corner_map, 0, sizeof(corner_map));
+    corner_map[0 * MAP_W + 1] = 2;
+    corner_map[1 * MAP_W + 0] = 2;
+    setup_test_pathmap(MAP_W, MAP_H, corner_map);
+
+    T_ASSERT(!CM_LineIsWalkable(&start, &goal));
+}
+
+TEST(wc3_pathfinding, closest_reachable_does_not_cross_diagonal_corner) {
+    BYTE corner_map[MAP_W * MAP_H];
+    VECTOR2 start = { 0.5f, 0.5f };
+    VECTOR2 target = { 1.5f, 1.5f };
+    VECTOR2 out = {0};
+    memset(corner_map, 0, sizeof(corner_map));
+    corner_map[0 * MAP_W + 1] = 2;
+    corner_map[1 * MAP_W + 0] = 2;
+    setup_test_pathmap(MAP_W, MAP_H, corner_map);
+
+    T_ASSERT(CM_ClosestReachablePointForRadius(&start, &target, 0.0f, &out));
+    T_FEQ(out.x, start.x, 0.001f);
+    T_FEQ(out.y, start.y, 0.001f);
+}
+
+TEST(wc3_pathfinding, movement_rejects_swept_static_obstacle) {
+    BYTE blocked_map[MAP_W * MAP_H];
+    VECTOR2 from = { 0.0f, 0.0f }, to = { 2.0f, 2.0f };
+    LPEDICT unit;
+    memset(blocked_map, 0, sizeof(blocked_map));
+    blocked_map[1 * MAP_W + 1] = 2;
+    setup_test_pathmap(MAP_W, MAP_H, blocked_map);
+    reset_entities();
+    unit = make_unit_at(from.x, from.y);
+    unit->collision = 0.0f;
+
+    T_ASSERT(!M_MoveIsValid(unit, &to));
+}
+
+/* -----------------------------------------------------------------------
+ * Flow-field cache consistency
+ *
+ * After a cache hit, get_flow_direction() must return the same vector as
+ * it did immediately after the original build.  This verifies that cached
+ * integration prices produce stable on-demand flow across cache lookups.
+ * --------------------------------------------------------------------- */
+
+TEST(wc3_pathfinding, flow_cache_consistent_after_hit) {
+    build_open_map();
+    setup_test_pathmap(MAP_W, MAP_H, open_map);
+
+    LPEDICT wp = make_waypoint(9.0f, 5.0f);
+    build_flow(wp);
+    VECTOR2 dir1 = flow_at_cell(2.0f, 5.0f);
+
+    /* Second build of the same goal must hit the cache. */
+    build_flow(wp);
+    VECTOR2 dir2 = flow_at_cell(2.0f, 5.0f);
+
+    T_FEQ(dir1.x, dir2.x, 0.001f);
+    T_FEQ(dir1.y, dir2.y, 0.001f);
+}
+
+/* -----------------------------------------------------------------------
+ * Multi-goal flow consistency
+ *
+ * After building two goals and switching back, the flow for each goal
+ * is consistent — switching between cached goals doesn't corrupt directions.
+ * --------------------------------------------------------------------- */
+
+TEST(wc3_pathfinding, flow_consistent_across_goal_switches) {
+    build_open_map();
+    setup_test_pathmap(MAP_W, MAP_H, open_map);
+
+    LPEDICT wp_left  = make_waypoint(1.0f, 5.0f);
+    LPEDICT wp_right = make_waypoint(9.0f, 5.0f);
+
+    /* Build both goals. */
+    build_flow(wp_right);
+    VECTOR2 flow_right = flow_at_cell(5.0f, 5.0f); /* should point right (+x) */
+
+    build_flow(wp_left);
+    VECTOR2 flow_left = flow_at_cell(5.0f, 5.0f);  /* should point left (-x) */
+
+    /* Switch back to right goal from cache. */
+    build_flow(wp_right);
+    VECTOR2 flow_right2 = flow_at_cell(5.0f, 5.0f);
+
+    /* Flow directions must be in opposite x halves. */
+    T_ASSERT(flow_right.x > 0.0f);
+    T_ASSERT(flow_left.x < 0.0f);
+    /* Cached right goal must match original. */
+    T_FEQ(flow_right.x, flow_right2.x, 0.001f);
+}
+
+/* -----------------------------------------------------------------------
+ * Proximity shortcut
+ *
+ * unit_changeangle uses direct vector math when the unit is within
+ * NAVI_THRESHOLD of its goal, skipping the heatmap.  Verify the unit
+ * gets a valid angle pointing toward the goal regardless.
+ * --------------------------------------------------------------------- */
+
+#define PF_NAVI_THRESHOLD 128.0f  /* must match g_ai.c */
+
+TEST(wc3_pathfinding, proximity_shortcut_gives_correct_angle) {
+    build_open_map();
+    setup_test_pathmap(MAP_W, MAP_H, open_map);
+    reset_entities();
+
+    /* Place unit close to goal (within NAVI_THRESHOLD). */
+    LPEDICT unit = make_unit_at(0.0f, 0.0f);
+    LPEDICT wp   = make_waypoint(5.0f, 5.0f);
+    unit->collision = 0.0f;
+    unit->goalentity = wp;
+    unit->stand      = unit_stand;
+    unit_stand(unit);
+    order_move(unit, wp);
+
+    /* Distance must be within threshold for the shortcut to apply. */
+    FLOAT dist = M_DistanceToGoal(unit);
+    T_ASSERT(dist < NAVI_THRESHOLD);
+
+    /* Units now turn gradually (at their turn rate) toward the target facing
+     * rather than snapping instantly, so step a few ticks to let the facing
+     * converge before checking the final direction. */
+    for (int i = 0; i < 16; i++) {
+        unit_changeangle(unit);
+    }
+
+    /* Angle must point from (0,0) toward the goal. */
+    FLOAT expected = atan2f(wp->s.origin.y - unit->s.origin.y,
+                            wp->s.origin.x - unit->s.origin.x);
+    T_FEQ(unit->s.angle, expected, 0.01f);
+}
+
+/* -----------------------------------------------------------------------
+ * Suite runner
+ * --------------------------------------------------------------------- */
+
+#endif /* BZ_TESTS */
