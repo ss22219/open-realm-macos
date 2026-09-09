@@ -218,6 +218,11 @@ void G_NormalizeModelFilename(LPCSTR authored, LPSTR out, size_t out_size) {
 }
 
 int G_RegisterModel(LPCSTR filename) {
+    /* A number of custom maps use a missile/unit row without an art path.
+     * ModelIndex ultimately copies the name into a fixed buffer, so passing
+     * NULL here crashes the whole map during CreateUnit.  Treat missing art
+     * as an invisible model, matching the game's permissive unit data. */
+    if (!filename || !*filename) return 0;
     int index = gi.ModelIndex(filename);
     if (index > 0 && index < G_MAX_MODELS && !g_models[index].filename[0])
         strncpy(g_models[index].filename, filename, MAX_PATHLEN - 1);

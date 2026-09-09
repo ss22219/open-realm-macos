@@ -134,7 +134,10 @@ void SCR_BeginLoadingPlaque(void) {
         return;
     if (cls.key_dest == key_console)
         return;
-    SCR_UpdateScreen(0);
+    /* Do not submit the loading frame before the map archive is mounted.
+     * Warcraft loading covers are map-local, so that first repaint can only
+     * be a black/placeholder frame.  CL_PrepRefresh repaints immediately
+     * after RegisterMap and model registration instead. */
     cls.disable_screen = SDL_GetTicks();
     cls.disable_servercount = -1;
 }
@@ -257,6 +260,8 @@ static HANDLE layout_layers[MAX_LAYOUT_LAYERS];
 static LPTEXTURE layout_dynamic_pics[MAX_DYNAMIC_IMAGES];
 static char layout_dynamic_pic_names[MAX_DYNAMIC_IMAGES][512];
 static DWORD layout_dynamic_pic_cursor;
+static LPTEXTURE loading_background_texture;
+static char loading_background_name[512];
 static BOOL layout_left_down;
 static char layout_held_command[CMDARG_LEN * 2];
 static DWORD layout_hovered_number;
@@ -871,6 +876,19 @@ void SCR_LayoutDrawPortrait(LPCUIFRAME frame, LPCRECT screen) {
 
     LPCSTR anim = (frame->text && *frame->text) ? frame->text : "Portrait";
 
+    /* Warcraft's loading background models are UI sprites stored as MDX, not
+     * portrait models: they have geosets but no MDLX camera.  Sending those
+     * through the portrait-camera path produces a valid black frame because
+     * the camera extraction fails.  Use the renderer's authored sprite path,
+     * which preserves the FDF frame placement and fills the loading canvas. */
+    if (re.GetModelInfo && re.DrawSprite) {
+        MODELINFO info = { 0 };
+        if (re.GetModelInfo(draw, &info) && !info.hasCamera) {
+            re.DrawSprite(draw, anim, screen->x, screen->y);
+            return;
+        }
+    }
+
     renderEntity_t entity = {0};
     entity.model = draw; entity.scale = 1.0f;
     entity.team = frame->stat;
@@ -897,8 +915,14 @@ void SCR_LayoutDrawPortrait(LPCUIFRAME frame, LPCRECT screen) {
 
 /* Loading bars are the one client-owned layout value; their art remains server-authored. */
 void SCR_LayoutDrawLoadingBar(LPCUIFRAME frame, LPCRECT screen) {
+    RECT centered = *screen;
+    /* LoadingBar.mdx contains retail 4:3 screen-space vertices.  The loading
+     * background may use the expanded widescreen canvas, but the bar itself
+     * must remain centered in that authored 4:3 region. */
+    if (SCR_UICanvasWidth() > UI_BASE_WIDTH)
+        centered.x += (SCR_UICanvasWidth() - UI_BASE_WIDTH) * 0.5f;
     if (frame->tex.index < MAX_IMAGES && cl.pics[frame->tex.index]) {
-        RECT fill = *screen;
+        RECT fill = centered;
         RECT uv = { 0, 0, 255, 255 };
         RECT suv;
         fill.w *= cl.loading_progress;
@@ -913,7 +937,7 @@ void SCR_LayoutDrawLoadingBar(LPCUIFRAME frame, LPCRECT screen) {
     snprintf(anim, sizeof(anim), "#0@%.4f", cl.loading_progress);
     bar.flags.type = FT_PORTRAIT;
     bar.text = anim;
-    SCR_LayoutDrawPortrait(&bar, screen);
+    SCR_LayoutDrawPortrait(&bar, &centered);
 }
 
 static void SCR_PreloadLoadingModels(void) {
@@ -927,9 +951,59 @@ static void SCR_PreloadLoadingModels(void) {
     }
 }
 
+/* Some custom maps put the actual loading cover in a TGA referenced by their
+ * Loading.mdx.  The MDX is a sprite container and is not reliable as a
+ * full-screen presentation on every renderer path, so draw its authored
+ * background texture directly and leave the progress bar/text as layout UI. */
+static void SCR_DrawMapLoadingBackground(const RECT *scene) {
+    if (!scene || !re.GetModelInfo || !re.LoadTexture || !re.GetTextureSize || !re.DrawImage)
+        return;
+
+    FOR_LOOP(i, MAX_MODELS) {
+        LPCSTR model_name = cl.configstrings[CS_MODELS + i];
+        MODELINFO info;
+        if (!model_name || !cl.models[i] ||
+            (strcasecmp(model_name, "Loading.mdx") && strcasecmp(model_name, "Loading.mdl")) ||
+            !re.GetModelInfo(cl.models[i], &info)) continue;
+        FOR_LOOP(t, info.textureCount) {
+            LPCSTR path = info.texturePaths[t];
+            size2_t size;
+            if (!path || !*path || !strcasestr(path, "loading") || strcasestr(path, "loadbar")) continue;
+            if (strcmp(loading_background_name, path)) {
+                snprintf(loading_background_name, sizeof(loading_background_name), "%s", path);
+                loading_background_texture = NULL;
+            }
+            if (!loading_background_texture)
+                loading_background_texture = re.LoadTexture(path);
+            size = re.GetTextureSize(loading_background_texture);
+            if (size.width > 16 && size.height > 16) {
+                re.DrawImage(loading_background_texture, scene,
+                             &MAKE(RECT, 0, 0, 1, 1), COLOR32_WHITE);
+                return;
+            }
+        }
+    }
+}
+
+void SCR_PreloadMapLoadingAssets(void) {
+    LPTEXTURE cover;
+    size2_t cover_size;
+
+    if (!re.LoadTexture || !re.GetTextureSize) return;
+    cover = re.LoadTexture("LoadingV2\\loading.tga");
+    cover_size = re.GetTextureSize(cover);
+    if (cover_size.width <= 16 || cover_size.height <= 16) return;
+    loading_background_texture = cover;
+    snprintf(loading_background_name, sizeof(loading_background_name),
+             "%s", "LoadingV2\\loading.tga");
+}
+
 void SCR_DrawLoadingFallback(void) {
     static LPCFONT font;
-    RECT scene = SCR_LayoutSceneRect();
+    /* Loading art is authored as a full-screen presentation.  The gameplay
+     * HUD remains centered at 4:3, but using that HUD root here leaves the
+     * loading image letterboxed on widescreen displays. */
+    RECT scene = MAKE(RECT, 0, 0, SCR_UICanvasWidth(), UI_BASE_HEIGHT);
     RECT bar = scene;
     RECT text_rect = scene;
     LPCSTR map_name = Cvar_String("map", "");
@@ -940,7 +1014,18 @@ void SCR_DrawLoadingFallback(void) {
      * presentation. Use the actual model that the server registered from
      * war3skins.txt when it is already available. */
     SCR_PreloadLoadingModels();
+    SCR_DrawMapLoadingBackground(&scene);
+    /* Prefer the map-authored loading model.  The old fallback only accepted
+     * the stock Load-Multiplayer model, so a map with Loading.mdx silently
+     * showed the stock dragon screen. */
     FOR_LOOP(i, MAX_MODELS) {
+        LPCSTR model = cl.configstrings[CS_MODELS + i];
+        if (!model || !cl.models[i] ||
+            (strcasecmp(model, "Loading.mdx") && strcasecmp(model, "Loading.mdl"))) continue;
+        background = i;
+        break;
+    }
+    if (!background) FOR_LOOP(i, MAX_MODELS) {
         LPCSTR model = cl.configstrings[CS_MODELS + i];
         if (!model || !cl.models[i] || !strstr(model, "Load-Multiplayer-")) continue;
         background = i;
@@ -1429,8 +1514,12 @@ void SCR_DrawLoadingLayout(void) {
     layout_current_window = false;
     layout_current_layer = LAYER_LOADING;
     SCR_Clear(layout);
-    root = SCR_LayoutSceneRect();
+    /* Keep loading backgrounds and their progress/text children in the full
+     * virtual canvas; ordinary gameplay layers still use the centered 4:3
+     * root from SCR_LayoutSceneRect(). */
+    root = MAKE(RECT, 0, 0, SCR_UICanvasWidth(), UI_BASE_HEIGHT);
     SCR_SetLayoutRoot(&root);
+    SCR_DrawMapLoadingBackground(&root);
     SCR_LayoutDrawOverlay(layout);
 }
 
@@ -1448,6 +1537,8 @@ void SCR_ClearLayoutResources(void) {
         layout_dynamic_pic_names[i][0] = '\0';
     }
     layout_dynamic_pic_cursor = 0;
+    loading_background_texture = NULL;
+    loading_background_name[0] = '\0';
 }
 
 static BOOL SCR_LayoutLayerVisible(DWORD layer) { return layer < MAX_LAYOUT_LAYERS && layout_layers[layer] && !((1u << layer) & cl.playerstate.uiflags); }

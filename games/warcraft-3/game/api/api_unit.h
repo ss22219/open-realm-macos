@@ -718,8 +718,55 @@ DWORD IsUnitRace(LPJASS j) {
 DWORD IsUnitType(LPJASS j) {
     LPEDICT whichUnit = jass_checkhandle(j, 1, "unit");
     LPDWORD whichUnitType = jass_checkhandle(j, 2, "unittype");
-    return jass_pushboolean(j, whichUnit && whichUnitType && *whichUnitType == 2 &&
-                              G_UnitIsBuilding(whichUnit->class_id));
+    BOOL result = false;
+    DWORD type;
+    if (!whichUnit || !whichUnitType) return jass_pushboolean(j, 0);
+    type = *whichUnitType;
+    if (type < 32 && (whichUnit->unit_type_flags & (1u << type))) {
+        result = true;
+    } else {
+        switch (type) {
+            case 0: result = G_UnitIsHero(whichUnit); break;       /* HERO */
+            case 1: result = M_IsDead(whichUnit); break;            /* DEAD */
+            case 2: result = G_UnitIsBuilding(whichUnit->class_id); break;
+            case 3: result = (whichUnit->aiflags & AI_FLYING) != 0; break;
+            case 4: result = (whichUnit->aiflags & AI_FLYING) == 0; break;
+            case 11: result = whichUnit->stunned; break;
+            case 23: result = whichUnit->sleeping; break;
+            default: break;
+        }
+    }
+    return jass_pushboolean(j, result);
+}
+DWORD UnitAddType(LPJASS j) {
+    LPEDICT whichUnit = jass_checkhandle(j, 1, "unit");
+    LPDWORD whichUnitType = jass_checkhandle(j, 2, "unittype");
+    DWORD type;
+    if (!whichUnit || !whichUnitType || *whichUnitType >= 32) {
+        return jass_pushboolean(j, 0);
+    }
+    type = *whichUnitType;
+    /* Permanent/derived classifications are queried from authoritative
+     * state.  Only mutable classifications are stored by these natives. */
+    if (type <= 8 || type == 14 || type == 16 || type == 18) {
+        return jass_pushboolean(j, 0);
+    }
+    whichUnit->unit_type_flags |= 1u << type;
+    return jass_pushboolean(j, 1);
+}
+DWORD UnitRemoveType(LPJASS j) {
+    LPEDICT whichUnit = jass_checkhandle(j, 1, "unit");
+    LPDWORD whichUnitType = jass_checkhandle(j, 2, "unittype");
+    DWORD type;
+    if (!whichUnit || !whichUnitType || *whichUnitType >= 32) {
+        return jass_pushboolean(j, 0);
+    }
+    type = *whichUnitType;
+    if (type <= 8 || type == 14 || type == 16 || type == 18) {
+        return jass_pushboolean(j, 0);
+    }
+    whichUnit->unit_type_flags &= ~(1u << type);
+    return jass_pushboolean(j, 1);
 }
 DWORD IsUnit(LPJASS j) {
     LPEDICT whichUnit = jass_checkhandle(j, 1, "unit");

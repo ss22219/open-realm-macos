@@ -282,7 +282,7 @@ static LPTEXTURE R_LoadTexturePath(LPCSTR textureFilename, BOOL *found) {
 }
 
 LPTEXTURE R_LoadTexture(LPCSTR textureFilename) {
-    PATHSTR candidates[4];
+    PATHSTR candidates[3];
     DWORD candidate_count = 0;
     LPTEXTURE texture;
     BOOL found = false;
@@ -294,9 +294,6 @@ LPTEXTURE R_LoadTexture(LPCSTR textureFilename) {
         candidate_count++;
     if (R_MapAssetRootCandidate(textureFilename, candidates[candidate_count], sizeof(candidates[0])))
         candidate_count++;
-    if (R_MapAssetImportedCandidate(textureFilename, candidates[candidate_count], sizeof(candidates[0])))
-        candidate_count++;
-
     FOR_LOOP(i, candidate_count) {
         BOOL duplicate = false;
         FOR_LOOP(j, i) if (!strcasecmp(candidates[i], candidates[j])) duplicate = true;

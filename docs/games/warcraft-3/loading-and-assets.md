@@ -151,6 +151,20 @@ invoke those handlers after showing the campaign screen; remove the hook afterwa
 the mission handler to capture the frozen loading plaque.
 Use `+com_frame_limit 100` for bounded runs; engine screenshots appear under `screenshots/`.
 
+For an external map loading-screen regression, use the game capture path directly:
+
+```sh
+build/bin/openwarcraft3 -data 'data/Warcraft III' \
+  +map '/absolute/path/to/map.w3x' +screenshot 5 +com_frame_limit 60
+```
+
+The capture is written as `screenshots/shotNNNN.jpg`. Map-local models are registered again
+after the map archive is mounted; this is required for a custom `Loading.mdx` and its TGA
+textures to resolve. The game also reloads map-mounted `Units/UnitUI.slk` and
+`Units/UnitData.slk` after `CM_LoadMap`, before spawning units. Do not use desktop capture
+for this check: the engine screenshot is the rendered framebuffer and catches the loading
+cover, progress bar, and text at the correct frame.
+
 Regression tests cover texture extension lookup and exact-file precedence, SLK replacement sentinels,
 ROC/TFT loading-row schemas, rotated/equal-height/diagonal cliff edges, unused FDF art, lazy texture cache hits/misses and theme changes,
 and loading destination/cache invalidation including UI reinitialization. The loading-cache unit test uses

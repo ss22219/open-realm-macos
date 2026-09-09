@@ -218,6 +218,7 @@ struct modelInfo_s {
     LPCSTR texturePaths[MODELINFO_MAX_TEXTURES];
     RECT textureUVRect;
     BOOL hasTextureUVRect;
+    BOOL hasCamera;
 };
 
 typedef struct {

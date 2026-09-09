@@ -680,7 +680,7 @@ typedef struct {
 #define JASS_GROUP_INITIAL_CAPACITY 64 // handle pointer slots; grows dynamically while group objects stay at stable addresses
 #define MAX_TRIGGERS 4096 // handles; bounds deterministic per-map trigger registry slots
 #define MAX_TIMERS 8192 // handles; large custom maps commonly allocate several thousand timers
-#define MAX_EVENTS 8192 // large imported maps can register thousands of trigger events
+#define MAX_EVENTS 32768 // large imported maps can register tens of thousands of trigger events
 #define MAX_QUESTS 256 // quests; fixed quest slots preserve stable pointers across removal
 #define MAX_QUESTITEMS 16 // items per quest; matches the practical quest objective display capacity
 #define MAX_WAYPOINTS 256 // entities; fixed g_edicts ring used by point-target movement
@@ -901,6 +901,10 @@ struct edict_s {
     DWORD spawn_time;
     DWORD harvested_lumber;
     DWORD harvested_gold;
+    /* Runtime JASS classifications (UnitAddType/UnitRemoveType).  The
+     * authored unit tables provide the permanent classifications; this mask
+     * stores temporary ones such as ANCIENT, STUNNED and SUMMONED. */
+    DWORD unit_type_flags;
     struct edictMilitia_s {
         DWORD ability;          /* Amil alias that supplied Data A/B and duration */
         DWORD normal_type;      /* Data A: worker form retained across the timed morph */

@@ -12,6 +12,8 @@ void UI_LoadHudLoading(void) {
         UI_SetPortraitFrameModel(hud.loading.LoadingBar, UI_LoadModel("LoadingProgressBar", true));
         hud.loading.LoadingBar->Type = FT_LOADING_BAR;
     }
+    if (hud.loading.LoadingBackground)
+        hud.loading.LoadingBackground->ui_flags |= UIFLAG_EXTEND_WIDESCREEN_X;
 }
 
 void UI_WriteLoadingLayout(LPEDICT ent) {
@@ -21,7 +23,12 @@ void UI_WriteLoadingLayout(LPEDICT ent) {
     LPCSTR background_key = info && info->loadingScreenModel && *info->loadingScreenModel
         ? info->loadingScreenModel : "LoadingMeleeBackground";
     LPCSTR background = background_key;
-    if (!strchr(background_key, '\\') && !strchr(background_key, '/')) {
+    /* W3I stores either a theme key (for example LoadingMeleeBackground) or
+     * an actual map/import model such as Loading.mdx.  Only theme keys go
+     * through Theme_PlayerString; resolving a filename as a theme key silently
+     * replaced the map's own loading cover with the stock random screen. */
+    if (!strchr(background_key, '\\') && !strchr(background_key, '/') &&
+        !strstr(background_key, ".mdx") && !strstr(background_key, ".mdl")) {
         background = Theme_PlayerString(ent ? ent->client : NULL, background_key,
             "UI\\Glues\\Loading\\Multiplayer\\Load-Multiplayer-Random.mdx");
     }

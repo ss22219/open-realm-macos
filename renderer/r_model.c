@@ -1,6 +1,7 @@
 #include "r_local.h"
 #include "r_game.h"
 #include <strings.h>
+#include <stdlib.h>
 
 #define MAX_MOD_KNOWN (MAX_MODELS * 4)
 
@@ -14,6 +15,12 @@ typedef struct {
 static KNOWNMODEL mod_known[MAX_MOD_KNOWN];
 static DWORD mod_registration_sequence = 1;
 static PATHSTR r_map_asset_scope;
+
+static BOOL R_MapAssetDebug(void) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("WC3_ASSET_DEBUG") ? 1 : 0;
+    return enabled != 0;
+}
 
 static LPCSTR R_MapAssetBasename(LPCSTR asset) {
     LPCSTR slash;
@@ -96,6 +103,8 @@ static LPMODEL R_LoadRegisteredModelPath(LPCSTR modelFilename, BOOL cache_missin
         return cache_missing ? R_LoadEmptyModel(modelFilename, "model registry exhausted") : NULL;
     }
     model = R_LoadModel(modelFilename);
+    if (R_MapAssetDebug() && !model)
+        fprintf(stderr, "WC3_ASSET_DEBUG model-miss path=\"%s\"\n", modelFilename);
     if (!model && !cache_missing) return NULL;
     if (!model) model = R_LoadEmptyModel(modelFilename, "not found");
     snprintf(entry->name, sizeof(entry->name), "%s", modelFilename);
@@ -107,28 +116,44 @@ static LPMODEL R_LoadRegisteredModelPath(LPCSTR modelFilename, BOOL cache_missin
 
 /* Quake II keeps one renderer model entry per resolved filename and marks it during registration. */
 LPMODEL R_LoadRegisteredModel(LPCSTR modelFilename) {
-    PATHSTR candidates[4];
+    PATHSTR candidates[3];
     DWORD candidate_count = 0;
     LPMODEL model;
 
     if (!modelFilename || !*modelFilename) return R_LoadEmptyModel("<empty>", "empty filename");
+    if (R_MapAssetDebug())
+        fprintf(stderr, "WC3_ASSET_DEBUG model-request name=\"%s\" scope=\"%s\"\n",
+                modelFilename, r_map_asset_scope);
     if (R_MapAssetCandidate(modelFilename, candidates[candidate_count], sizeof(candidates[0])))
         candidate_count++;
     if (R_MapAssetImportedCandidate(modelFilename, candidates[candidate_count], sizeof(candidates[0])))
         candidate_count++;
     if (R_MapAssetRootCandidate(modelFilename, candidates[candidate_count], sizeof(candidates[0])))
         candidate_count++;
-    if (R_MapAssetImportedCandidate(modelFilename, candidates[candidate_count], sizeof(candidates[0])))
-        candidate_count++;
-
     FOR_LOOP(i, candidate_count) {
         BOOL duplicate = false;
         FOR_LOOP(j, i) if (!strcasecmp(candidates[i], candidates[j])) duplicate = true;
         if (duplicate) continue;
         model = R_LoadRegisteredModelPath(candidates[i], false);
-        if (model) return model;
+        if (model) {
+            if (R_MapAssetDebug())
+                fprintf(stderr, "WC3_ASSET_DEBUG model-hit candidate=\"%s\"\n", candidates[i]);
+            return model;
+        }
     }
-    return R_LoadRegisteredModelPath(modelFilename, true);
+    if (R_MapAssetDebug())
+        fprintf(stderr, "WC3_ASSET_DEBUG model-unresolved name=\"%s\"\n", modelFilename);
+    if (r_map_asset_scope[0] && getenv("WC3_STRICT_ASSETS")) {
+        fprintf(stderr, "WC3_STRICT_ASSETS: unresolved model \"%s\" in map \"%s\"\n",
+                modelFilename, r_map_asset_scope);
+        exit(2);
+    }
+    model = R_LoadRegisteredModelPath(modelFilename, true);
+    if (R_MapAssetDebug())
+        fprintf(stderr, "WC3_ASSET_DEBUG model-fallback name=\"%s\" model=%p type=%08x mdx=%p\n",
+                modelFilename, (void *)model, model ? (unsigned)model->modeltype : 0u,
+                model ? (void *)model->mdx : NULL);
+    return model;
 }
 
 /* Release drops caller ownership; stale resident images are reclaimed at the next registration boundary. */

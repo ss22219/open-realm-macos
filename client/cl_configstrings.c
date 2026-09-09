@@ -33,6 +33,9 @@ static void CL_RegisterModelConfigString(DWORD index, BOOL replace, LPCSTR olds)
         snprintf(portrait + base_len, sizeof(portrait) - base_len, "_Portrait%s", ext);
     }
     cl.models[model] = re.LoadModel(name);
+    if (getenv("WC3_ASSET_DEBUG"))
+        fprintf(stderr, "WC3_ASSET_DEBUG client-model index=%u name=\"%s\" loaded=%p\n",
+                (unsigned)model, name, (void *)cl.models[model]);
     if (!cl.models[model]) fprintf(stderr, "CL_RegisterModelConfigString: failed to load %s\n", name);
     if (portrait[0] && FS_FileExists(portrait)) cl.portraits[model] = re.LoadModel(portrait);
 }

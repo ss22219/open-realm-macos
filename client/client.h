@@ -274,6 +274,7 @@ void SCR_UpdateLoadingPlaque(void);
 void SCR_EndLoadingPlaque(void);
 void SCR_ClearLayoutResources(void);
 void SCR_DrawLoadingFallback(void);
+void SCR_PreloadMapLoadingAssets(void);
 
 // cl_screenshot.c
 extern BOOL cl_screenshot_pending;

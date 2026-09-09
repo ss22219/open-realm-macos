@@ -437,6 +437,7 @@ bool R_GetModelInfo(LPMODEL model, LPMODELINFO info) {
         return false;
     }
     memset(info, 0, sizeof(*info));
+    info->hasCamera = model->mdx->cameras != NULL;
 
     R_W3BuildModelTextureCache(model);
     if (model_texture_cache.model == model) {
@@ -482,6 +483,10 @@ bool R_ExtractEntityCamera(renderEntity_t const *entity, float aspect, viewDef_t
     }
     bool ok = MDLX_ExtractCamera(entity->model->mdx, entity->frame, aspect, &viewdef->viewProjectionMatrix,
                                  &viewdef->lightMatrix);
+    if (getenv("WC3_ASSET_DEBUG") && (!entity->model->mdx->cameras || !ok))
+        fprintf(stderr, "WC3_ASSET_DEBUG portrait-camera failed cameras=%p geosets=%p frame=%u aspect=%.3f\n",
+                (void *)entity->model->mdx->cameras, (void *)entity->model->mdx->geosets,
+                (unsigned)entity->frame, aspect);
     Matrix4_identity(&viewdef->textureMatrix);
     return ok;
 }

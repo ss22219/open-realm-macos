@@ -229,6 +229,11 @@ static bool G_LoadMap(LPCSTR mapFilename) {
         G_SetMapUnitOverrides(NULL);
         return false;
     }
+    /* The server mounts external maps before calling LoadMap. Reload the
+     * typed unit tables now so map-local Units\UnitUI.slk and
+     * Units\UnitData.slk take precedence before any unit is spawned. */
+    ShutdownUnitData();
+    InitUnitData();
     /* CS_MODELS is rebuilt from index 1 for every SV_Map.  The server-side
      * animation metadata cache uses those indices too, so retaining it across
      * levels can make a new index resolve to the previous map's filename. */

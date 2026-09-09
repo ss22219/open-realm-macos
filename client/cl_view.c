@@ -468,14 +468,34 @@ void CL_PrepRefresh(void) {
         return;
     }
 
-    CL_LoadingStage(0.10f);
-
     if (!world_loaded) {
         if (!CM_IsMapLoaded(cl.configstrings[CS_WORLD])) {
             CM_LoadMap(cl.configstrings[CS_WORLD]);
         }
         re.RegisterMap(cl.configstrings[CS_WORLD]);
         world_loaded = true;
+
+        /* Loading.mdx and other imported models can be registered by the
+         * server before the renderer knows which map archive is active.  They
+         * then become cached empty placeholders during the first loading
+         * frame.  Re-register model configstrings after RegisterMap installs
+         * the map asset scope so the map's own model and texture files are
+         * actually resolved. */
+        for (DWORD i = 1; i < MAX_MODELS; i++) {
+            if (*cl.configstrings[CS_MODELS + i])
+                CL_UpdateConfigString(CS_MODELS + i, NULL);
+        }
+
+        /* This map family stores the real cover outside the Loading.mdx
+         * texture list as LoadingV2/loading.tga.  Touch it immediately after
+         * the nested archive is registered, so the first loading repaint does
+         * not wait for a later layout pass to mount/decode the image. */
+        SCR_PreloadMapLoadingAssets();
+
+        /* The first visible loading frame must follow map mounting.  Before
+         * this point Loading.mdx/loading.tga cannot be resolved from the map
+         * archive, so showing progress here only produces a black plaque. */
+        CL_LoadingStage(0.20f);
     }
     CL_LoadingStage(0.40f);
 

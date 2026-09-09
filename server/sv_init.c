@@ -252,6 +252,14 @@ void SV_Map(LPCSTR mapFilename) {
     strlcpy(sv.configstrings[CS_WORLD], mapFilename, sizeof(sv.configstrings[CS_WORLD]));
     SZ_Init(&sv.multicast, sv.multicast_buf, MAX_MSGLEN);
     SV_SetConfigString(CS_MAXCLIENTS, "", 1);
+    /* Make an external map's MPQ visible to the common filesystem before the
+     * game module reloads UnitUI/UnitData. The renderer keeps its own map
+     * scope, but the game tables are loaded through FS_ReadFile. */
+    {
+        PATHSTR loose_map_path;
+        if (FS_ResolveLoosePath(mapFilename, loose_map_path, sizeof(loose_map_path)))
+            FS_AddArchive(loose_map_path);
+    }
     if (!ge->LoadMap(mapFilename)) {
         fprintf(stderr, "SV_Map: map load failed\n");
         sv.state = ss_dead;

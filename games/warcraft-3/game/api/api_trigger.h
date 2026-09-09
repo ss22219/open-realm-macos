@@ -214,7 +214,9 @@ DWORD TriggerRegisterTimerEvent(LPJASS j) {
     LPEVENT evt;
     if (!whichTrigger || !(timer = G_AllocJassTimer())) return jass_pushnullhandle(j, "event");
     G_TimerStart(timer, (DWORD)(MAX(0.0f, timeout) * 1000.0f), periodic, NULL);
-    evt = G_MakeEvent(EVENT_GAME_TIMER_EXPIRED); evt->trigger = whichTrigger; evt->timer = timer;
+    evt = G_MakeEvent(EVENT_GAME_TIMER_EXPIRED);
+    if (!evt) return jass_pushnullhandle(j, "event");
+    evt->trigger = whichTrigger; evt->timer = timer;
     QuestPeonStageLogRegistration(whichTrigger, EVENT_GAME_TIMER_EXPIRED, NULL, "timer");
     return jass_pushlighthandle(j, evt, "event");
 }
@@ -223,7 +225,9 @@ DWORD TriggerRegisterTimerExpireEvent(LPJASS j) {
     LPGTIMER timer = jass_checkhandle(j, 2, "timer");
     LPEVENT evt;
     if (!whichTrigger || !timer) return jass_pushnullhandle(j, "event");
-    evt = G_MakeEvent(EVENT_GAME_TIMER_EXPIRED); evt->trigger = whichTrigger; evt->timer = timer;
+    evt = G_MakeEvent(EVENT_GAME_TIMER_EXPIRED);
+    if (!evt) return jass_pushnullhandle(j, "event");
+    evt->trigger = whichTrigger; evt->timer = timer;
     QuestPeonStageLogRegistration(whichTrigger, EVENT_GAME_TIMER_EXPIRED, NULL, "timer-expire");
     return jass_pushlighthandle(j, evt, "event");
 }
@@ -233,6 +237,7 @@ DWORD TriggerRegisterGameStateEvent(LPJASS j) {
     LPDWORD opcode = jass_checkhandle(j, 3, "limitop");
     FLOAT limitval = jass_checknumber(j, 4);
     LPEVENT evt = G_MakeEvent(EVENT_GAME_STATE_LIMIT);
+    if (!evt) return jass_pushnullhandle(j, "event");
     evt->trigger = whichTrigger;
     evt->state = whichState ? *whichState : 0;
     evt->limitop = opcode ? *opcode : 0;
@@ -260,9 +265,31 @@ DWORD TriggerRegisterEnterRegion(LPJASS j) {
     LPREGION whichRegion = jass_checkhandle(j, 2, "region");
     //HANDLE filter = jass_checkhandle(j, 3, "boolexpr");
     LPEVENT evt = G_MakeEvent(EVENT_GAME_ENTER_REGION);
+    if (!whichTrigger || !whichRegion || !evt) return jass_pushnullhandle(j, "event");
     evt->trigger = whichTrigger;
     evt->region = *whichRegion;
     QuestPeonStageLogRegistration(whichTrigger, EVENT_GAME_ENTER_REGION, NULL, "enter-region");
+    return jass_pushlighthandle(j, evt, "event");
+}
+/* Blizzard.j's TriggerRegisterEnterRectSimple helper is not present in the
+ * trimmed runtime Blizzard.j used by OpenRealm.  Maps commonly use this
+ * helper for gameplay choices (including moving a hero into a choice zone),
+ * so expose the same native behavior directly: one rectangular region and no
+ * filter. */
+DWORD TriggerRegisterEnterRectSimple(LPJASS j) {
+    LPTRIGGER whichTrigger = jass_checkhandle(j, 1, "trigger");
+    LPCBOX2 whichRect = jass_checkhandle(j, 2, "rect");
+    LPEVENT evt;
+
+    if (!whichTrigger || !whichRect) {
+        return jass_pushnullhandle(j, "event");
+    }
+    evt = G_MakeEvent(EVENT_GAME_ENTER_REGION);
+    if (!evt) return jass_pushnullhandle(j, "event");
+    evt->trigger = whichTrigger;
+    evt->region.num_rects = 1;
+    evt->region.rects[0] = *whichRect;
+    QuestPeonStageLogRegistration(whichTrigger, EVENT_GAME_ENTER_REGION, NULL, "enter-rect");
     return jass_pushlighthandle(j, evt, "event");
 }
 DWORD GetTriggeringRegion(LPJASS j) {
@@ -288,7 +315,12 @@ DWORD TriggerRegisterPlayerEvent(LPJASS j) {
     LPTRIGGER whichTrigger = jass_checkhandle(j, 1, "trigger");
     LPPLAYER whichPlayer = jass_checkhandle(j, 2, "player");
     EVENTTYPE *whichPlayerEvent = jass_checkhandle(j, 3, "playerevent");
-    LPEVENT evt = G_MakeEvent(*whichPlayerEvent);
+    LPEVENT evt;
+    if (!whichTrigger || !whichPlayer || !whichPlayerEvent) {
+        return jass_pushnullhandle(j, "event");
+    }
+    evt = G_MakeEvent(*whichPlayerEvent);
+    if (!evt) return jass_pushnullhandle(j, "event");
     evt->subject = PLAYER_ENT(whichPlayer);
     evt->trigger = whichTrigger;
     QuestPeonStageLogRegistration(whichTrigger, *whichPlayerEvent, evt->subject, "player");
@@ -304,6 +336,7 @@ DWORD TriggerRegisterPlayerEventLeave(LPJASS j) {
     LPTRIGGER whichTrigger = jass_checkhandle(j, 1, "trigger");
     LPPLAYER whichPlayer = jass_checkhandle(j, 2, "player");
     LPEVENT evt = G_MakeEvent(EVENT_PLAYER_LEAVE);
+    if (!whichTrigger || !whichPlayer || !evt) return jass_pushnullhandle(j, "event");
     evt->subject = PLAYER_ENT(whichPlayer);
     evt->trigger = whichTrigger;
     return jass_pushlighthandle(j, evt, "event");
@@ -316,7 +349,12 @@ DWORD TriggerRegisterPlayerUnitEvent(LPJASS j) {
     LPPLAYER whichPlayer = jass_checkhandle(j, 2, "player");
     EVENTTYPE *whichPlayerUnitEvent = jass_checkhandle(j, 3, "playerunitevent");
     //HANDLE filter = jass_checkhandle(j, 4, "boolexpr");
-    LPEVENT evt = G_MakeEvent(*whichPlayerUnitEvent);
+    LPEVENT evt;
+    if (!whichTrigger || !whichPlayer || !whichPlayerUnitEvent) {
+        return jass_pushnullhandle(j, "event");
+    }
+    evt = G_MakeEvent(*whichPlayerUnitEvent);
+    if (!evt) return jass_pushnullhandle(j, "event");
     evt->subject = PLAYER_ENT(whichPlayer);
     evt->trigger = whichTrigger;
     QuestPeonStageLogRegistration(whichTrigger, *whichPlayerUnitEvent, evt->subject, "player-unit");
@@ -365,6 +403,7 @@ DWORD TriggerRegisterDeathEvent(LPJASS j) {
     LPEDICT whichWidget = jass_checkhandle(j, 2, "widget");
     if (!whichTrigger || !whichWidget) return jass_pushnullhandle(j, "event");
     LPEVENT evt = G_MakeEvent(EVENT_UNIT_DEATH);
+    if (!evt) return jass_pushnullhandle(j, "event");
     evt->subject = whichWidget;
     evt->trigger = whichTrigger;
     QuestPeonStageLogRegistration(whichTrigger, EVENT_UNIT_DEATH, evt->subject, "death");
@@ -386,6 +425,7 @@ DWORD TriggerRegisterUnitEvent(LPJASS j) {
         return jass_pushnullhandle(j, "event");
     }
     LPEVENT evt = G_MakeEvent(*whichEvent);
+    if (!evt) return jass_pushnullhandle(j, "event");
     evt->subject = whichUnit;
     evt->trigger = whichTrigger;
     QuestPeonStageLogRegistration(whichTrigger, *whichEvent, evt->subject, "unit");
@@ -417,6 +457,7 @@ DWORD TriggerRegisterUnitInRange(LPJASS j) {
         return jass_pushnullhandle(j, "event");
     }
     LPEVENT evt = G_MakeEvent(EVENT_UNIT_IN_RANGE);
+    if (!evt) return jass_pushnullhandle(j, "event");
     evt->subject = whichUnit;
     evt->trigger = whichTrigger;
     evt->range = range;

@@ -2512,6 +2512,7 @@ constant native GetWinningPlayer takes nothing returns player
 
 
 native TriggerRegisterEnterRegion takes trigger whichTrigger, region whichRegion, boolexpr filter returns event
+native TriggerRegisterEnterRectSimple takes trigger whichTrigger, rect whichRect returns event
 
 // EVENT_GAME_ENTER_REGION
 constant native GetTriggeringRegion takes nothing returns region
