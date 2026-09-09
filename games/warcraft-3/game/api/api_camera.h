@@ -8,10 +8,11 @@ extern LPPLAYER currentplayer;
 
 static LPGAMECLIENT G_CurrentCameraClient(LPCSTR func) {
     (void)func;
-    if (!currentplayer) {
-        return NULL;
-    }
-    return G_GetPlayerClientByNumber(PLAYER_NUM(currentplayer));
+    /* Camera BJ wrappers execute in a GetLocalPlayer() branch.  The JASS VM
+     * temporarily binds currentplayer while evaluating that branch, but a
+     * direct single-player call can reach the native without that binding.
+     * The local loopback client is player 0 in that case. */
+    return G_GetPlayerClientByNumber(currentplayer ? PLAYER_NUM(currentplayer) : 0);
 }
 
 static FLOAT G_CameraHorizontalToVerticalFov(FLOAT horizontal) {

@@ -205,7 +205,15 @@ DWORD Player(LPJASS j) {
     return jass_pushlighthandle(j, player, "player");
 }
 DWORD GetLocalPlayer(LPJASS j) {
-    return jass_pushlighthandle(j, (LPMAPPLAYER)currentplayer, "player");
+    /* JASS may execute from a timer/event coroutine without a preserved
+     * local-player context.  In a local game the connected client is still
+     * the local player; returning null here makes the stock Blizzard result
+     * dialogs crash when they call DisplayTimedTextFromPlayer. */
+    LPPLAYER player = currentplayer;
+    if (!player) {
+        player = G_GetPlayerByNumber(0);
+    }
+    return jass_pushlighthandle(j, player, "player");
 }
 DWORD IsPlayerAlly(LPJASS j) {
     LPPLAYER whichPlayer = jass_checkhandle(j, 1, "player");
@@ -642,7 +650,8 @@ DWORD DisplayTextToPlayer(LPJASS j) {
                 toPlayer ? (int)PLAYER_NUM(toPlayer) : -1, x, y,
                 message ? message : "", G_LevelString(message) ? G_LevelString(message) : "");
     }
-    UI_ShowText(PLAYER_ENT(toPlayer), &MAKE(VECTOR2, x, y), message, -1.0f);
+    LPEDICT recipient = toPlayer ? PLAYER_ENT(toPlayer) : NULL;
+    if (recipient) UI_ShowText(recipient, &MAKE(VECTOR2, x, y), message, -1.0f);
     return 0;
 }
 DWORD DisplayTimedTextToPlayer(LPJASS j) {
@@ -661,7 +670,8 @@ DWORD DisplayTimedTextToPlayer(LPJASS j) {
                 toPlayer ? (int)PLAYER_NUM(toPlayer) : -1, x, y, duration,
                 message ? message : "", G_LevelString(message) ? G_LevelString(message) : "");
     }
-    UI_ShowText(PLAYER_ENT(toPlayer), &MAKE(VECTOR2, x, y), message, duration);
+    LPEDICT recipient = toPlayer ? PLAYER_ENT(toPlayer) : NULL;
+    if (recipient) UI_ShowText(recipient, &MAKE(VECTOR2, x, y), message, duration);
     return 0;
 }
 DWORD DisplayTimedTextFromPlayer(LPJASS j) {
@@ -680,7 +690,8 @@ DWORD DisplayTimedTextFromPlayer(LPJASS j) {
                 toPlayer ? (int)PLAYER_NUM(toPlayer) : -1, x, y, duration,
                 message ? message : "", G_LevelString(message) ? G_LevelString(message) : "");
     }
-    UI_ShowText(PLAYER_ENT(toPlayer), &MAKE(VECTOR2, x, y), message, duration);
+    LPEDICT recipient = toPlayer ? PLAYER_ENT(toPlayer) : NULL;
+    if (recipient) UI_ShowText(recipient, &MAKE(VECTOR2, x, y), message, duration);
     return 0;
 }
 DWORD ClearTextMessages(LPJASS j) {
