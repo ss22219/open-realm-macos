@@ -508,11 +508,21 @@ void G_ApplyUnitAbilityTraits(LPEDICT ent) {
  * unit's class_id and stores them in the edict. */
 void SP_SpawnUnit(LPEDICT self) {
     PATHSTR model_filename;
+    UnitProfile_t const *profile;
     if (!self) return;
     UnitBalance_t const *b = self->data.UnitBalance;
     UnitData_t const *d = self->data.UnitData;
     UnitUI_t const *ui = self->data.UnitUI;
     UnitWeapons_t const *w = self->data.UnitWeapons;
+    profile = G_UnitProfile(self->class_id);
+    /* A map may create an object id that is present in only part of the
+     * custom SLK set.  Keep the entity alive, but do not dereference an
+     * incomplete row while building its presentation. */
+    if (!b || !d || !ui || !w) {
+        self->s.model = 0;
+        self->svflags |= SVF_NOCLIENT;
+        return;
+    }
     LPCSTR uber_splat = ui->groundTexture;
     LPCSTR path_tex = d->pathingTexture;
     G_InitStockSlots(self);
@@ -653,9 +663,10 @@ void SP_SpawnUnit(LPEDICT self) {
         self->attack1.origin.x = G_UnitAttack1LaunchX(self->class_id);
         self->attack1.origin.y = G_UnitAttack1LaunchY(self->class_id);
         self->attack1.origin.z = G_UnitAttack1LaunchZ(self->class_id);
-        self->attack1.projectile.model = G_RegisterModel(G_UnitProfile(self->class_id)->attack[0].art);
-        self->attack1.projectile.arc = G_UnitProfile(self->class_id)->attack[0].arc;
-        self->attack1.projectile.speed = G_UnitProfile(self->class_id)->attack[0].speed;
+        self->attack1.projectile.model = profile && profile->attack[0].art
+            ? G_RegisterModel(profile->attack[0].art) : 0;
+        self->attack1.projectile.arc = profile ? profile->attack[0].arc : 0.0f;
+        self->attack1.projectile.speed = profile ? profile->attack[0].speed : 0.0f;
     }
 
     if ((self->pathtex = M_LoadPathTex(path_tex))) {
