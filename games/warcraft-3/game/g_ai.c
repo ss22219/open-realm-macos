@@ -413,7 +413,6 @@ static void unit_apply_heading(LPEDICT self, LPCVECTOR2 dir, moveAvoidPolicy_t p
     FLOAT const goal_angle = dirlen > 0.001f ? atan2f(dir->y, dir->x) : self->s.angle;
     FLOAT const raw_delta = fabsf(angle_wrap(goal_angle - self->s.angle));
     BOOL const move_order = self->currentmove && self->currentmove->ability == &a_move;
-    BOOL const direct_move = move_order && self->movement.flow_direct;
     FLOAT desired;
     if (dirlen <= 0.001f)
         return;  /* no meaningful heading this tick: hold current facing */
@@ -443,19 +442,15 @@ static void unit_apply_heading(LPEDICT self, LPCVECTOR2 dir, moveAvoidPolicy_t p
          * has caught up, a materially different route heading (for example a
          * newly reached path waypoint) is allowed to start a new line. */
         if (self->movement.propulsion_line_active &&
-            !direct_move) {
+            fabsf(angle_wrap(self->s.angle - self->movement.propulsion_heading)) < 0.01f) {
             self->movement.propulsion_line_active = false;
         }
-        if (self->movement.propulsion_line_active &&
-            fabsf(angle_wrap(self->s.angle - self->movement.propulsion_heading)) < 0.01f &&
-            (fabsf(angle_wrap(goal_angle - self->movement.propulsion_heading)) > 0.20f ||
-             fabsf(angle_wrap(desired - self->movement.propulsion_heading)) > 0.20f)) {
-            self->movement.propulsion_line_active = false;
-        }
-        /* Only a clear direct move gets the strict no-arc contract.  A
-         * routed move or a dynamic-unit avoidance step must remain free to
-         * replace its waypoint heading as the route develops. */
-        if (!self->movement.propulsion_line_active && direct_move &&
+        /* Every Move path segment gets the strict no-arc contract.  The
+         * resolved waypoint heading is captured before propulsion starts and
+         * remains the translation line while the body catches up.  Routed
+         * movement may install a new line only after this segment is aligned
+         * and the route heading has materially changed. */
+        if (!self->movement.propulsion_line_active &&
             raw_delta > 0.001f &&
             fabsf(angle_wrap(desired - goal_angle)) < 0.01f) {
             self->movement.propulsion_heading = desired;
