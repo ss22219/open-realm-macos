@@ -589,6 +589,7 @@ JASSMODULE jass_funcs[] = {
     { "SetUnitPathing", SetUnitPathing },
     { "ClearSelection", ClearSelection },
     { "SelectUnit", SelectUnit },
+    { "SelectUnitForPlayerSingle", SelectUnitForPlayerSingle },
     { "GetUnitPointValue", GetUnitPointValue },
     { "GetUnitPointValueByType", GetUnitPointValueByType },
     { "UnitAddItem", UnitAddItem },

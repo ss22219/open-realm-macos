@@ -2962,6 +2962,7 @@ native          SetUnitPathing      takes unit whichUnit, boolean flag returns n
 
 native          ClearSelection      takes nothing returns nothing
 native          SelectUnit          takes unit whichUnit, boolean flag returns nothing
+native          SelectUnitForPlayerSingle takes unit whichUnit, player whichPlayer returns nothing
 
 native          GetUnitPointValue       takes unit whichUnit returns integer
 native          GetUnitPointValueByType takes integer unitType returns integer

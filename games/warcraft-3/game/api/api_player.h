@@ -785,7 +785,7 @@ DWORD SetBlightLoc(LPJASS j) {
 DWORD ClearSelection(LPJASS j) {
     FOR_LOOP(i, globals.num_edicts) {
         if (currentplayer) {
-            g_edicts[i].selected &= 1 << PLAYER_NUM(currentplayer);
+            g_edicts[i].selected &= ~(1u << PLAYER_NUM(currentplayer));
         } else {
             g_edicts[i].selected = 0;
         }
@@ -806,10 +806,35 @@ DWORD SelectUnit(LPJASS j) {
         }
     } else {
         if (currentplayer) {
-            whichUnit->selected &= 1 << PLAYER_NUM(currentplayer);
+            whichUnit->selected &= ~(1u << PLAYER_NUM(currentplayer));
         } else {
             whichUnit->selected = 0;
         }
     }
+    return 0;
+}
+DWORD SelectUnitForPlayerSingle(LPJASS j) {
+    LPEDICT whichUnit = jass_checkhandle(j, 1, "unit");
+    LPPLAYER whichPlayer = jass_checkhandle(j, 2, "player");
+    LPGAMECLIENT client;
+    DWORD player_number;
+    DWORD selection_bit;
+
+    if (!whichPlayer) return 0;
+    player_number = PLAYER_NUM(whichPlayer);
+    if (player_number >= sizeof(DWORD) * CHAR_BIT) return 0;
+    selection_bit = 1u << player_number;
+
+    FOR_LOOP(i, globals.num_edicts) {
+        g_edicts[i].selected &= ~selection_bit;
+    }
+    client = G_GetPlayerClientByNumber(player_number);
+    G_ResetSelectionFocus(client);
+
+    if (whichUnit) {
+        whichUnit->selected |= selection_bit;
+        if (client) G_FocusSelectedUnit(client, whichUnit);
+    }
+    if (client) G_SyncClientSelection(client);
     return 0;
 }
