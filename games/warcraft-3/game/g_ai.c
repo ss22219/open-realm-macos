@@ -438,21 +438,23 @@ static void unit_apply_heading(LPEDICT self, LPCVECTOR2 dir, moveAvoidPolicy_t p
         : unit_desired_heading(self, goal_angle, unit_movedistance(self), policy);
 
     if (move_order) {
-        /* Keep the first resolved line while the unit turns.  Once the body
-         * has caught up, a materially different route heading (for example a
-         * newly reached path waypoint) is allowed to start a new line. */
-        if (self->movement.propulsion_line_active &&
-            fabsf(angle_wrap(self->s.angle - self->movement.propulsion_heading)) < 0.01f) {
-            self->movement.propulsion_line_active = false;
-        }
-        /* Every Move path segment gets the strict no-arc contract.  The
-         * resolved waypoint heading is captured before propulsion starts and
-         * remains the translation line while the body catches up.  Routed
-         * movement may install a new line only after this segment is aligned
-         * and the route heading has materially changed. */
-        if (!self->movement.propulsion_line_active &&
-            raw_delta > 0.001f &&
-            fabsf(angle_wrap(desired - goal_angle)) < 0.01f) {
+        /* Every Move path segment gets the strict no-arc contract.  Capture
+         * the resolved heading before the body turns and keep translating on
+         * that line for the whole turn.  The old code dropped the lock as
+         * soon as s.angle caught up; on that same frame local avoidance could
+         * replace the heading, making the first few post-turn steps follow a
+         * rotating vector and draw a visible arc.
+         *
+         * A line can be replaced only after the body is already aligned with
+         * it.  The replacement is itself a new straight segment, so a route
+         * corner or a dynamic-unit sidestep cannot inherit the body's turn. */
+        if (self->movement.propulsion_line_active) {
+            BOOL const aligned = fabsf(angle_wrap(
+                self->s.angle - self->movement.propulsion_heading)) < 0.01f;
+            if (aligned && fabsf(angle_wrap(
+                    desired - self->movement.propulsion_heading)) > 0.01f)
+                self->movement.propulsion_heading = desired;
+        } else if (fabsf(angle_wrap(desired - self->s.angle)) > 0.001f) {
             self->movement.propulsion_heading = desired;
             self->movement.propulsion_line_active = true;
         }
