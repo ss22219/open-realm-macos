@@ -409,7 +409,6 @@ static FLOAT unit_desired_heading(LPEDICT self, FLOAT goal_angle, FLOAT dist,
 
 static void unit_apply_heading(LPEDICT self, LPCVECTOR2 dir, moveAvoidPolicy_t policy) {
     FLOAT const dirlen = Vector2_len(dir);
-    FLOAT propulsion_window;
     FLOAT const goal_angle = dirlen > 0.001f ? atan2f(dir->y, dir->x) : self->s.angle;
     FLOAT const raw_delta = fabsf(angle_wrap(goal_angle - self->s.angle));
     BOOL const move_order = self->currentmove && self->currentmove->ability == &a_move;
@@ -417,22 +416,11 @@ static void unit_apply_heading(LPEDICT self, LPCVECTOR2 dir, moveAvoidPolicy_t p
     if (dirlen <= 0.001f)
         return;  /* no meaningful heading this tick: hold current facing */
 
-    propulsion_window = self->data.UnitData ? self->data.UnitData->propWin : 0.0f;
-
-    /* UnitData.propWin is authored in degrees (Java compares it with its
-     * degree-valued facing delta), while the native simulation stores angles
-     * in radians.  A missing custom value is treated as an open window so a
-     * sparse map row remains movable. */
-    if (propulsion_window > 0.0f)
-        propulsion_window *= (FLOAT)M_PI / 180.0f;
-    else
-        propulsion_window = (FLOAT)M_PI;
-
-    /* Keep the resolved route line locked for the whole turn, including the
-     * slow-start frames inside propWin.  If avoidance replaces it before the
-     * body is aligned, a reverse order starts on a lateral heading and draws
-     * the circular arc this behavior is meant to avoid.  Dynamic avoidance
-     * resumes once the body is aligned. */
+    /* Keep the resolved route line locked for the whole turn.  Translation is
+     * always along this line; only its scalar speed changes with the angle
+     * between the body and the goal.  This gives the authored behavior of a
+     * slow straight start while avoiding the half-circle produced by using
+     * the body's rotating facing as the position vector. */
     desired = move_order && raw_delta > 0.001f
         ? goal_angle
         : unit_desired_heading(self, goal_angle, unit_movedistance(self), policy);
@@ -462,15 +450,17 @@ static void unit_apply_heading(LPEDICT self, LPCVECTOR2 dir, moveAvoidPolicy_t p
             desired = self->movement.propulsion_heading;
     }
     FLOAT const angle_delta = fabsf(angle_wrap(desired - self->s.angle));
-    self->movement.propulsion_ready = angle_delta < propulsion_window;
-    if (self->movement.propulsion_ready) {
-        /* Retail movement eases in at the edge of the propulsion window.  A
-         * small floor prevents a unit from appearing frozen for one frame,
-         * while exact alignment immediately restores full speed. */
-        FLOAT const alignment = 1.0f - angle_delta / MAX(propulsion_window, 0.001f);
-        self->movement.propulsion_factor = MAX(0.15f, MIN(1.0f, alignment));
+    if (move_order) {
+        /* The angular dot product is remapped from [-1, 1] to [0, 1].  A
+         * tiny floor keeps a 180-degree turn visibly moving, while a unit
+         * that has fully faced the goal gets its complete move speed. */
+        FLOAT const angular_alignment = 0.5f * (1.0f + cosf(angle_delta));
+        self->movement.propulsion_ready = true;
+        self->movement.propulsion_factor = MAX(0.05f,
+                                               MIN(1.0f, angular_alignment));
     } else {
-        self->movement.propulsion_factor = 0.0f;
+        self->movement.propulsion_ready = true;
+        self->movement.propulsion_factor = 1.0f;
     }
     self->movement.heading = desired;
     unit_turn_toward(self, desired);

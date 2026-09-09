@@ -2550,18 +2550,20 @@ TEST(wc3_movement, unit_position_changes_after_move_frame) {
     T_ASSERT(unit->s.origin2.x > x0);
 }
 
-/* A reverse order is not a steering arc.  The unit turns in place until the
- * propulsion window opens, then advances on the goal line at reduced speed
- * while its facing finishes turning.  The exact 180-degree tie must also use
+/* A reverse order is not a steering arc.  The unit advances on the goal line
+ * immediately at an angularly reduced speed while its facing turns, then
+ * reaches full speed when aligned.  The exact 180-degree tie must also use
  * one stable turn direction. */
 TEST(wc3_movement, reverse_move_is_straight_and_starts_slow) {
     LPEDICT unit = make_moving_unit(100.0f, 0.0f);
     UnitData_t unit_data = *unit->data.UnitData;
     VECTOR2 const dest = {-100.0f, 0.0f};
     FLOAT first_step = 0.0f;
+    FLOAT previous_step = 0.0f;
     FLOAT full_step;
     FLOAT first_move_angle = 0.0f;
     BOOL moved = false;
+    BOOL speed_increased = false;
 
     unit_data.turnRate = 0.25f;
     unit_data.propWin = 45.0f;
@@ -2589,7 +2591,11 @@ TEST(wc3_movement, reverse_move_is_straight_and_starts_slow) {
                 first_step = Vector2_len(&moved_by);
                 first_move_angle = unit->s.angle;
                 T_ASSERT(first_step < full_step);
+                T_ASSERT(first_step > 0.0f);
+            } else if (Vector2_len(&moved_by) > previous_step + 0.0001f) {
+                speed_increased = true;
             }
+            previous_step = Vector2_len(&moved_by);
             moved = true;
             T_ASSERT(unit->s.origin2.x < before_x);
         }
@@ -2598,6 +2604,7 @@ TEST(wc3_movement, reverse_move_is_straight_and_starts_slow) {
     }
 
     T_ASSERT(moved);
+    T_ASSERT(speed_increased);
     T_ASSERT(first_move_angle < (FLOAT)M_PI);
 }
 
