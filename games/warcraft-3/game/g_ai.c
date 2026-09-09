@@ -449,6 +449,11 @@ static void unit_apply_heading(LPEDICT self, LPCVECTOR2 dir, moveAvoidPolicy_t p
         if (self->movement.propulsion_line_active)
             desired = self->movement.propulsion_heading;
     }
+    /* Advance the model facing first, then derive propulsion from the facing
+     * that is actually visible for this simulation frame.  Computing this
+     * from the pre-turn angle made acceleration lag one frame behind the
+     * model, especially noticeable on a 180-degree order. */
+    unit_turn_toward(self, desired);
     FLOAT const angle_delta = fabsf(angle_wrap(desired - self->s.angle));
     if (move_order) {
         /* The angular dot product is remapped from [-1, 1] to [0, 1].  A
@@ -463,7 +468,6 @@ static void unit_apply_heading(LPEDICT self, LPCVECTOR2 dir, moveAvoidPolicy_t p
         self->movement.propulsion_factor = 1.0f;
     }
     self->movement.heading = desired;
-    unit_turn_toward(self, desired);
 }
 
 static void unit_changeangle_towards_point_policy(LPEDICT self, LPCVECTOR2 point,
