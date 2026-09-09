@@ -508,6 +508,7 @@ void G_ApplyUnitAbilityTraits(LPEDICT ent) {
  * unit's class_id and stores them in the edict. */
 void SP_SpawnUnit(LPEDICT self) {
     PATHSTR model_filename;
+    if (!self) return;
     UnitBalance_t const *b = self->data.UnitBalance;
     UnitData_t const *d = self->data.UnitData;
     UnitUI_t const *ui = self->data.UnitUI;
@@ -526,8 +527,11 @@ void SP_SpawnUnit(LPEDICT self) {
     } else {
         M_SetUnitShadow(self);
     }
-    self->s.scale = ui->modelScale;
-    self->s.radius = ui->selectionScale * SEL_SCALE / 2;
+    /* Some map-local UnitUI rows omit optional numeric fields.  A zero model
+     * scale makes a perfectly valid MDX render as if the unit did not exist;
+     * WC3 treats the omitted value as the normal unit scale. */
+    self->s.scale = ui->modelScale > 0.0f ? ui->modelScale : 1.0f;
+    self->s.radius = (ui->selectionScale > 0.0f ? ui->selectionScale : 1.0f) * SEL_SCALE / 2;
     /* Unit-vs-unit separation uses the authentic collisionSize ('ucol') from
      * the unit data, matching WC3. Buildings have no meaningful collisionSize
      * and instead block via their pathing footprint (set from pathtex below). */

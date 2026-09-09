@@ -204,14 +204,33 @@ DWORD Player(LPJASS j) {
     LPPLAYER player = G_GetPlayerByNumber(number);
     return jass_pushlighthandle(j, player, "player");
 }
+
+/* Native player handles are light handles.  Keep presentation natives from
+ * treating an arbitrary/stale handle as a player object: PLAYER_NUM() would
+ * dereference it before G_GetPlayerEntityByNumber() gets a chance to reject
+ * it.  Handles produced by Player()/GetLocalPlayer() always point at one of
+ * the fixed game client slots. */
+static LPPLAYER PlayerPresentationHandle(LPPLAYER candidate) {
+    if (!candidate) return NULL;
+    FOR_LOOP(i, MAX_PLAYERS) {
+        if (candidate == &game.clients[i].ps) return candidate;
+    }
+    return NULL;
+}
+
+static LPEDICT PlayerPresentationEntity(LPPLAYER candidate) {
+    candidate = PlayerPresentationHandle(candidate);
+    return candidate ? G_GetPlayerEntityByNumber(candidate->number) : NULL;
+}
+
 DWORD GetLocalPlayer(LPJASS j) {
     /* JASS may execute from a timer/event coroutine without a preserved
      * local-player context.  In a local game the connected client is still
      * the local player; returning null here makes the stock Blizzard result
      * dialogs crash when they call DisplayTimedTextFromPlayer. */
-    LPPLAYER player = currentplayer;
+    LPPLAYER player = PlayerPresentationHandle(currentplayer);
     if (!player) {
-        player = G_GetPlayerByNumber(0);
+        player = PlayerPresentationHandle(G_GetPlayerByNumber(0));
     }
     return jass_pushlighthandle(j, player, "player");
 }
@@ -637,6 +656,7 @@ DWORD FogModifierStop(LPJASS j) {
 }
 DWORD DisplayTextToPlayer(LPJASS j) {
     LPPLAYER toPlayer = jass_checkhandle(j, 1, "player");
+    LPPLAYER safePlayer = PlayerPresentationHandle(toPlayer);
     FLOAT x = jass_checknumber(j, 2);
     FLOAT y = jass_checknumber(j, 3);
     LPCSTR message = jass_checkstring(j, 4);
@@ -647,15 +667,16 @@ DWORD DisplayTextToPlayer(LPJASS j) {
         fprintf(stderr,
                 "WC3_TUTORIAL_TEXT native=DisplayTextToPlayer trigger=%ld caller=\"%s\" player=%d x=%.3f y=%.3f duration=auto raw=\"%s\" resolved=\"%s\"\n",
                 (long)trigger_ordinal, caller ? caller : "(native/root)",
-                toPlayer ? (int)PLAYER_NUM(toPlayer) : -1, x, y,
+                safePlayer ? (int)safePlayer->number : -1, x, y,
                 message ? message : "", G_LevelString(message) ? G_LevelString(message) : "");
     }
-    LPEDICT recipient = toPlayer ? PLAYER_ENT(toPlayer) : NULL;
+    LPEDICT recipient = PlayerPresentationEntity(safePlayer);
     if (recipient) UI_ShowText(recipient, &MAKE(VECTOR2, x, y), message, -1.0f);
     return 0;
 }
 DWORD DisplayTimedTextToPlayer(LPJASS j) {
     LPPLAYER toPlayer = jass_checkhandle(j, 1, "player");
+    LPPLAYER safePlayer = PlayerPresentationHandle(toPlayer);
     FLOAT x = jass_checknumber(j, 2);
     FLOAT y = jass_checknumber(j, 3);
     FLOAT duration = jass_checknumber(j, 4);
@@ -667,15 +688,16 @@ DWORD DisplayTimedTextToPlayer(LPJASS j) {
         fprintf(stderr,
                 "WC3_TUTORIAL_TEXT native=DisplayTimedTextToPlayer trigger=%ld caller=\"%s\" player=%d x=%.3f y=%.3f duration=%.3f raw=\"%s\" resolved=\"%s\"\n",
                 (long)trigger_ordinal, caller ? caller : "(native/root)",
-                toPlayer ? (int)PLAYER_NUM(toPlayer) : -1, x, y, duration,
+                safePlayer ? (int)safePlayer->number : -1, x, y, duration,
                 message ? message : "", G_LevelString(message) ? G_LevelString(message) : "");
     }
-    LPEDICT recipient = toPlayer ? PLAYER_ENT(toPlayer) : NULL;
+    LPEDICT recipient = PlayerPresentationEntity(safePlayer);
     if (recipient) UI_ShowText(recipient, &MAKE(VECTOR2, x, y), message, duration);
     return 0;
 }
 DWORD DisplayTimedTextFromPlayer(LPJASS j) {
     LPPLAYER toPlayer = jass_checkhandle(j, 1, "player");
+    LPPLAYER safePlayer = PlayerPresentationHandle(toPlayer);
     FLOAT x = jass_checknumber(j, 2);
     FLOAT y = jass_checknumber(j, 3);
     FLOAT duration = jass_checknumber(j, 4);
@@ -687,10 +709,10 @@ DWORD DisplayTimedTextFromPlayer(LPJASS j) {
         fprintf(stderr,
                 "WC3_TUTORIAL_TEXT native=DisplayTimedTextFromPlayer trigger=%ld caller=\"%s\" player=%d x=%.3f y=%.3f duration=%.3f raw=\"%s\" resolved=\"%s\"\n",
                 (long)trigger_ordinal, caller ? caller : "(native/root)",
-                toPlayer ? (int)PLAYER_NUM(toPlayer) : -1, x, y, duration,
+                safePlayer ? (int)safePlayer->number : -1, x, y, duration,
                 message ? message : "", G_LevelString(message) ? G_LevelString(message) : "");
     }
-    LPEDICT recipient = toPlayer ? PLAYER_ENT(toPlayer) : NULL;
+    LPEDICT recipient = PlayerPresentationEntity(safePlayer);
     if (recipient) UI_ShowText(recipient, &MAKE(VECTOR2, x, y), message, duration);
     return 0;
 }
