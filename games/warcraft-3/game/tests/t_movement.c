@@ -2550,6 +2550,110 @@ TEST(wc3_movement, unit_position_changes_after_move_frame) {
     T_ASSERT(unit->s.origin2.x > x0);
 }
 
+/* A reverse order is not a steering arc.  The unit turns in place until the
+ * propulsion window opens, then advances on the goal line at reduced speed
+ * while its facing finishes turning.  The exact 180-degree tie must also use
+ * one stable turn direction. */
+TEST(wc3_movement, reverse_move_is_straight_and_starts_slow) {
+    LPEDICT unit = make_moving_unit(100.0f, 0.0f);
+    UnitData_t unit_data = *unit->data.UnitData;
+    VECTOR2 const dest = {-100.0f, 0.0f};
+    FLOAT first_step = 0.0f;
+    FLOAT full_step;
+    FLOAT first_move_angle = 0.0f;
+    BOOL moved = false;
+
+    unit_data.turnRate = 0.25f;
+    unit_data.propWin = 45.0f;
+    unit->data.UnitData = &unit_data;
+    unit->unitinfo.MoveSpeed = 100.0f;
+    unit->s.angle = 0.0f;
+    full_step = unit_movedistance(unit);
+    T_ASSERT(unit_issueorder(unit, "move", &dest));
+
+    for (int frame = 0; frame < 32; frame++) {
+        FLOAT const before_x = unit->s.origin2.x;
+        FLOAT const before_y = unit->s.origin2.y;
+        FLOAT const before_angle = unit->s.angle;
+        unit->currentmove->think(unit);
+        if (fabsf(unit->s.origin2.x - before_x) > 0.0001f ||
+            fabsf(unit->s.origin2.y - before_y) > 0.0001f) {
+            VECTOR2 const moved_by = {
+                unit->s.origin2.x - before_x,
+                unit->s.origin2.y - before_y,
+            };
+            /* Every propulsion step stays on the resolved goal line.  Using
+             * the body's still-turning facing here would draw a circular arc. */
+            T_FEQ(moved_by.y, 0.0f, 0.001f);
+            if (!moved) {
+                first_step = Vector2_len(&moved_by);
+                first_move_angle = unit->s.angle;
+                T_ASSERT(first_step < full_step);
+            }
+            moved = true;
+            T_ASSERT(unit->s.origin2.x < before_x);
+        }
+        if (frame == 0)
+            T_ASSERT(unit->s.angle > before_angle);
+    }
+
+    T_ASSERT(moved);
+    T_ASSERT(first_move_angle < (FLOAT)M_PI);
+}
+
+/* The same no-arc contract must hold after Move selects a flow-field
+ * waypoint.  The old implementation only used the fixed target line for a
+ * direct move, so a reverse order that needed pathing still advanced along
+ * the body's half-turned facing and drew a circular arc. */
+TEST(wc3_movement, routed_reverse_move_starts_on_route_heading) {
+    enum { CELLS = 16 };
+    BYTE pathmap[CELLS * CELLS] = {0};
+    LPEDICT unit = make_moving_unit(432.0f, 240.0f);
+    UnitData_t unit_data = *unit->data.UnitData;
+    VECTOR2 const dest = {80.0f, 240.0f};
+    BOOL moved = false;
+
+    for (int y = 3; y <= 12; y++)
+        pathmap[y * CELLS + 7] = 2;
+    CM_SetupTestPathmap(CELLS, CELLS, pathmap);
+    CM_SetupTestWorldBounds(&MAKE(BOX2, .min = {0.0f, 0.0f}, .max = {512.0f, 512.0f}));
+    unit_data.turnRate = 0.25f;
+    unit_data.propWin = 45.0f;
+    unit->data.UnitData = &unit_data;
+    unit->collision = 16.0f;
+    unit->unitinfo.MoveSpeed = 80.0f;
+    unit->s.angle = 0.0f;
+    gi.LinkEntity(unit);
+    order_move(unit, Waypoint_add(&dest));
+
+    for (int frame = 0; frame < 120; frame++) {
+        FLOAT const before_x = unit->s.origin2.x;
+        FLOAT const before_y = unit->s.origin2.y;
+        if (unit->currentmove && unit->currentmove->think)
+            unit->currentmove->think(unit);
+        CM_ProcessPathJobs(4096);
+        if (fabsf(unit->s.origin2.x - before_x) > 0.0001f ||
+            fabsf(unit->s.origin2.y - before_y) > 0.0001f) {
+            VECTOR2 const moved_by = {
+                unit->s.origin2.x - before_x,
+                unit->s.origin2.y - before_y,
+            };
+            VECTOR2 const route_heading = {
+                cosf(unit->movement.heading),
+                sinf(unit->movement.heading),
+            };
+            moved = true;
+            /* The step must use the resolved route heading, not the body's
+             * still-turning facing.  The latter is what drew the arc. */
+            T_FEQ(moved_by.x * route_heading.y - moved_by.y * route_heading.x,
+                  0.0f, 0.001f);
+            break;
+        }
+    }
+
+    T_ASSERT(moved);
+}
+
 /* Route generation must expand obstacles by the mover radius, matching the
  * move-time collision test.  The point route hugs this wall too closely; a
  * Peasant-sized route has room to detour above it and reach the destination. */

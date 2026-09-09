@@ -207,7 +207,18 @@ static void unit_commit_step(LPEDICT self, LPCVECTOR2 cand) {
  * visibly rotate/wobble and crab sideways past each other and trees. */
 static void unit_moveindirection_policy(LPEDICT self,
                                         moveCollisionPolicy_t collision_policy) {
+    BOOL const move_order = self->currentmove &&
+        self->currentmove->ability == &a_move;
     if (self->aiflags & AI_IMMOBILE)
+        return;
+
+    /* OpenWCIII's CBehaviorMove turns in place while the goal is outside the
+     * propulsion window.  Once the window opens, start slowly on the resolved
+     * straight heading while the body finishes turning; never use the old
+     * facing as a second steering decision, which is what created the visible
+     * half-circle/arc on a 180-degree turn. */
+    if (move_order && (!self->movement.propulsion_ready ||
+                       self->movement.propulsion_factor <= 0.0f))
         return;
 
     /* unit_changeangle* clears both routing fields before resolving this
@@ -219,18 +230,12 @@ static void unit_moveindirection_policy(LPEDICT self,
     if (!self->movement.flow_direct && !self->movement.path_valid && self->movement.flow_generation == 0)
         return;
 
-    FLOAT const dist = unit_movedistance(self);
-    VECTOR2 const by_facing = Vector2_mad(&self->s.origin2, dist,
-                                          &MAKE(VECTOR2, cosf(self->s.angle), sinf(self->s.angle)));
-    if (move_is_valid_policy(self, &by_facing, collision_policy)) {
-        unit_commit_step(self, &by_facing);
-        return;
-    }
+    FLOAT const dist = unit_movedistance(self) *
+        (move_order ? self->movement.propulsion_factor : 1.0f);
     VECTOR2 const by_heading = Vector2_mad(&self->s.origin2, dist,
                                            &MAKE(VECTOR2, cosf(self->movement.heading), sinf(self->movement.heading)));
-    if (move_is_valid_policy(self, &by_heading, collision_policy)) {
+    if (move_is_valid_policy(self, &by_heading, collision_policy))
         unit_commit_step(self, &by_heading);
-    }
 }
 
 void unit_moveindirection(LPEDICT self) {
@@ -263,21 +268,23 @@ BOOL unit_snap_to_point_ignore_units(LPEDICT self, LPCVECTOR2 point) {
  * signed sin of the angle to turn, dot = cos); atan2 only writes the canonical
  * s.angle the renderer/network consume. */
 static void unit_turn_toward(LPEDICT self, FLOAT target) {
-    VECTOR2 const facing = { cosf(self->s.angle), sinf(self->s.angle) };
-    VECTOR2 const goal   = { cosf(target), sinf(target) };
-    FLOAT const cross = facing.x * goal.y - facing.y * goal.x;
-    FLOAT const dot   = facing.x * goal.x + facing.y * goal.y;
     FLOAT turn = self->data.UnitData->turnRate;
+    FLOAT delta;
     if (turn <= 0.0f) turn = 0.5f;
 
-    if (dot >= cosf(turn)) {
+    /* Work from the wrapped signed angle instead of a cross product.  At
+     * exactly 180 degrees the cross product is zero in exact arithmetic, but
+     * sinf(+PI) and sinf(-PI) have opposite tiny rounding errors.  That made
+     * a reverse order choose a different side from one frame/map to another.
+     * Warcraft's tie-break is deterministic: take the positive direction. */
+    delta = angle_wrap(target - self->s.angle);
+    if (fabsf(fabsf(delta) - (FLOAT)M_PI) < 0.0001f)
+        delta = (FLOAT)M_PI;
+
+    if (fabsf(delta) <= turn) {
         self->s.angle = target;  /* within one tick's turn: snap */
     } else {
-        FLOAT const st = cross >= 0.0f ? sinf(turn) : -sinf(turn);
-        FLOAT const ct = cosf(turn);
-        VECTOR2 const nf = { facing.x * ct - facing.y * st,
-                             facing.x * st + facing.y * ct };
-        self->s.angle = atan2f(nf.y, nf.x);
+        self->s.angle = angle_wrap(self->s.angle + (delta > 0.0f ? turn : -turn));
     }
 }
 
@@ -395,15 +402,43 @@ static FLOAT unit_desired_heading(LPEDICT self, FLOAT goal_angle, FLOAT dist,
 
 static void unit_apply_heading(LPEDICT self, LPCVECTOR2 dir, moveAvoidPolicy_t policy) {
     FLOAT const dirlen = Vector2_len(dir);
+    FLOAT propulsion_window;
+    FLOAT const goal_angle = dirlen > 0.001f ? atan2f(dir->y, dir->x) : self->s.angle;
+    FLOAT const raw_delta = fabsf(angle_wrap(goal_angle - self->s.angle));
+    FLOAT desired;
     if (dirlen <= 0.001f)
         return;  /* no meaningful heading this tick: hold current facing */
 
-    /* Local avoidance resolves into ONE heading; the facing turns toward it and
-     * the move step (unit_moveindirection) follows it, keeping facing and motion
-     * aligned (no second, disagreeing search). */
-    FLOAT const goal_angle = atan2f(dir->y, dir->x);
-    FLOAT const desired = unit_desired_heading(self, goal_angle,
-                                                unit_movedistance(self), policy);
+    propulsion_window = self->data.UnitData ? self->data.UnitData->propWin : 0.0f;
+
+    /* UnitData.propWin is authored in degrees (Java compares it with its
+     * degree-valued facing delta), while the native simulation stores angles
+     * in radians.  A missing custom value is treated as an open window so a
+     * sparse map row remains movable. */
+    if (propulsion_window > 0.0f)
+        propulsion_window *= (FLOAT)M_PI / 180.0f;
+    else
+        propulsion_window = (FLOAT)M_PI;
+
+    /* Keep the resolved route line locked for the whole turn, including the
+     * slow-start frames inside propWin.  If avoidance replaces it before the
+     * body is aligned, a reverse order starts on a lateral heading and draws
+     * the circular arc this behavior is meant to avoid.  Dynamic avoidance
+     * resumes once the body is aligned. */
+    desired = self->currentmove && raw_delta > 0.001f
+        ? goal_angle
+        : unit_desired_heading(self, goal_angle, unit_movedistance(self), policy);
+    FLOAT const angle_delta = fabsf(angle_wrap(desired - self->s.angle));
+    self->movement.propulsion_ready = angle_delta < propulsion_window;
+    if (self->movement.propulsion_ready) {
+        /* Retail movement eases in at the edge of the propulsion window.  A
+         * small floor prevents a unit from appearing frozen for one frame,
+         * while exact alignment immediately restores full speed. */
+        FLOAT const alignment = 1.0f - angle_delta / MAX(propulsion_window, 0.001f);
+        self->movement.propulsion_factor = MAX(0.15f, MIN(1.0f, alignment));
+    } else {
+        self->movement.propulsion_factor = 0.0f;
+    }
     self->movement.heading = desired;
     unit_turn_toward(self, desired);
 }
@@ -415,6 +450,7 @@ static void unit_changeangle_towards_point_policy(LPEDICT self, LPCVECTOR2 point
     if (!self || !point || (self->aiflags & AI_IMMOBILE))
         return;
     self->movement.heading = self->s.angle;
+    self->movement.propulsion_ready = false;
     self->movement.flow_generation = 0;
     self->movement.flow_goal_reached = false;
     self->movement.flow_unreachable = false;
@@ -468,6 +504,7 @@ BOOL unit_changeangle_towards_point_ignore_units(LPEDICT self, LPCVECTOR2 point)
         return false;
 
     self->movement.heading = self->s.angle;
+    self->movement.propulsion_ready = false;
     self->movement.flow_generation = 0;
     self->movement.flow_goal_reached = false;
     self->movement.flow_unreachable = false;
@@ -498,6 +535,7 @@ static void unit_changeangle_policy(LPEDICT self, moveAvoidPolicy_t policy) {
     FLOAT const radius = unit_routes_to_location(self) ? self->collision : 0.0f;
 
     self->movement.heading = self->s.angle;  /* default if no heading is resolved this tick */
+    self->movement.propulsion_ready = false;
     self->movement.flow_generation = 0;
     self->movement.flow_goal_reached = false;
     self->movement.flow_unreachable = false;
@@ -584,6 +622,8 @@ static void unit_changeangle_for_radius_policy(LPEDICT self, FLOAT radius,
     VECTOR2 dir;
 
     self->movement.heading = self->s.angle;
+    self->movement.propulsion_ready = false;
+    self->movement.propulsion_factor = 0.0f;
     self->movement.flow_generation = 0;
     self->movement.flow_goal_reached = false;
     self->movement.flow_unreachable = false;
