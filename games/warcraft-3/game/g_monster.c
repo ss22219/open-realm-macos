@@ -561,10 +561,15 @@ void SP_SpawnUnit(LPEDICT self) {
     if (b->sightRadius > 0 || b->nightSightRadius > 0) {
         self->s.flags |= EF_FOW_REVEALER;
     }
-    self->mana.max_value = b->maxMana;
+    /* Some classic/custom UnitBalance rows only populate the integer base
+     * fields (baseHealth/baseMana) and leave the TFT real fields at zero.
+     * Warsmash resolves these rows to the same usable starting values; using
+     * the zero real field here makes a valid Wisp selection unit immediately
+     * dead and therefore impossible to select or move. */
+    self->mana.max_value = b->maxMana > 0.0f ? b->maxMana : (FLOAT)MAX(0, b->baseMana);
     self->mana.value = MIN(self->mana.max_value, b->initialMana);
-    self->health.value = b->maxHealth;
-    self->health.max_value = b->maxHealth;
+    self->health.max_value = b->maxHealth > 0.0f ? b->maxHealth : (FLOAT)MAX(1, b->baseHealth);
+    self->health.value = self->health.max_value;
     self->invulnerable = G_ActorHasSkill(self, "Avul");
     G_ApplyUnitAbilityTraits(self);
     self->unitinfo.MoveSpeed = b->speed;
