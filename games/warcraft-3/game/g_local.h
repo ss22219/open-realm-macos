@@ -849,6 +849,8 @@ struct edict_s {
 
     // keep above in sync with server.h
     DWORD class_id;
+    /* JASS integer payload used by GetUnitUserData/SetUnitUserData. */
+    LONG user_data;
     DWORD variation;
     DWORD build_project;
     BOOL rally_indicator;
@@ -1023,6 +1025,10 @@ struct edict_s {
         BOOL path_valid;
         FLOAT group_speed;  // slowest member's speed for a group move (0 = no cap), keeps the group together
         FLOAT heading;      // avoidance-resolved heading chosen this tick by unit_changeangle; movement follows it
+        BOOL propulsion_ready; /* Java CBehaviorMove: move only inside propWin */
+        FLOAT propulsion_factor; /* gradual start after propWin; 0=turn only, 1=full speed */
+        FLOAT propulsion_heading; /* fixed travel line while the body catches up */
+        BOOL propulsion_line_active; /* separates translation from visual facing */
         VECTOR2 worker_avoid_origin; /* start of the active resource-worker avoidance corridor */
         FLOAT worker_avoid_heading;  /* direct corridor heading captured when local blocking begins */
         DWORD worker_avoid_blocked_frames; /* consecutive blocked decisions before queue escape */

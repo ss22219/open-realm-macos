@@ -232,8 +232,15 @@ static void unit_moveindirection_policy(LPEDICT self,
 
     FLOAT const dist = unit_movedistance(self) *
         (move_order ? self->movement.propulsion_factor : 1.0f);
+    /* The body is allowed to keep turning after propulsion starts, but the
+     * translation must stay on the line selected when propulsion opened.  Do
+     * not derive this vector from s.angle: doing that makes a 180-degree turn
+     * trace the body's rotation as a visible circular arc. */
+    FLOAT const travel_heading = move_order && self->movement.propulsion_line_active
+        ? self->movement.propulsion_heading
+        : self->movement.heading;
     VECTOR2 const by_heading = Vector2_mad(&self->s.origin2, dist,
-                                           &MAKE(VECTOR2, cosf(self->movement.heading), sinf(self->movement.heading)));
+                                           &MAKE(VECTOR2, cosf(travel_heading), sinf(travel_heading)));
     if (move_is_valid_policy(self, &by_heading, collision_policy))
         unit_commit_step(self, &by_heading);
 }
@@ -405,6 +412,8 @@ static void unit_apply_heading(LPEDICT self, LPCVECTOR2 dir, moveAvoidPolicy_t p
     FLOAT propulsion_window;
     FLOAT const goal_angle = dirlen > 0.001f ? atan2f(dir->y, dir->x) : self->s.angle;
     FLOAT const raw_delta = fabsf(angle_wrap(goal_angle - self->s.angle));
+    BOOL const move_order = self->currentmove && self->currentmove->ability == &a_move;
+    BOOL const direct_move = move_order && self->movement.flow_direct;
     FLOAT desired;
     if (dirlen <= 0.001f)
         return;  /* no meaningful heading this tick: hold current facing */
@@ -425,9 +434,36 @@ static void unit_apply_heading(LPEDICT self, LPCVECTOR2 dir, moveAvoidPolicy_t p
      * body is aligned, a reverse order starts on a lateral heading and draws
      * the circular arc this behavior is meant to avoid.  Dynamic avoidance
      * resumes once the body is aligned. */
-    desired = self->currentmove && raw_delta > 0.001f
+    desired = move_order && raw_delta > 0.001f
         ? goal_angle
         : unit_desired_heading(self, goal_angle, unit_movedistance(self), policy);
+
+    if (move_order) {
+        /* Keep the first resolved line while the unit turns.  Once the body
+         * has caught up, a materially different route heading (for example a
+         * newly reached path waypoint) is allowed to start a new line. */
+        if (self->movement.propulsion_line_active &&
+            !direct_move) {
+            self->movement.propulsion_line_active = false;
+        }
+        if (self->movement.propulsion_line_active &&
+            fabsf(angle_wrap(self->s.angle - self->movement.propulsion_heading)) < 0.01f &&
+            (fabsf(angle_wrap(goal_angle - self->movement.propulsion_heading)) > 0.20f ||
+             fabsf(angle_wrap(desired - self->movement.propulsion_heading)) > 0.20f)) {
+            self->movement.propulsion_line_active = false;
+        }
+        /* Only a clear direct move gets the strict no-arc contract.  A
+         * routed move or a dynamic-unit avoidance step must remain free to
+         * replace its waypoint heading as the route develops. */
+        if (!self->movement.propulsion_line_active && direct_move &&
+            raw_delta > 0.001f &&
+            fabsf(angle_wrap(desired - goal_angle)) < 0.01f) {
+            self->movement.propulsion_heading = desired;
+            self->movement.propulsion_line_active = true;
+        }
+        if (self->movement.propulsion_line_active)
+            desired = self->movement.propulsion_heading;
+    }
     FLOAT const angle_delta = fabsf(angle_wrap(desired - self->s.angle));
     self->movement.propulsion_ready = angle_delta < propulsion_window;
     if (self->movement.propulsion_ready) {

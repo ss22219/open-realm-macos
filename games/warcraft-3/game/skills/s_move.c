@@ -175,6 +175,9 @@ void move_reset_progress(LPEDICT self) {
     self->movement.worker_avoid_blocked_frames = 0;
     self->movement.worker_avoid_active = false;
     self->movement.group_speed = 0;  /* single-unit/default: travel at own speed */
+    self->movement.propulsion_ready = true;
+    self->movement.propulsion_heading = self->s.angle;
+    self->movement.propulsion_line_active = false;
 }
 
 /* Effective current move speed of a unit (runtime override, else data table). */
